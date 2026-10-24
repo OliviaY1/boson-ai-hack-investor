@@ -529,6 +529,15 @@ export class InterviewVoiceSession implements InterviewTransport {
     if (this.current?.completionTimer) clearTimeout(this.current.completionTimer);
     for (const p of this.pending) clearTimeout(p.timer);
     this.engine.detachTransport(this.interviewId, this);
+    const now = getInterview(this.ctx, this.interviewId);
+    if (now.lifecycle === "ended") {
+      // E.g. the participant left during the closing line: its playback outcome is unknown, not completed.
+      const open = this.ctx.db.prepare("SELECT id, state FROM delivery_attempts WHERE interview_id = ? AND state IN ('queued','speaking')").all(this.interviewId) as any[];
+      if (open.length)
+        commit(this.ctx, now.project_id, "delivery.session_closed", (cs) => {
+          for (const d of open) transitionDelivery(this.ctx, cs, d.id, d.state === "queued" ? "cancelled" : "unknown", { detail: "session closed before playback was confirmed" });
+        });
+    }
     if (markInterruptedState && interruptReason) {
       const iv = getInterview(this.ctx, this.interviewId);
       if (iv.lifecycle !== "ended") markInterrupted(this.ctx, this.interviewId, interruptReason, false);

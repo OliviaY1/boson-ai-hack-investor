@@ -30,6 +30,8 @@ jobs:
       - run: npm run build
       - run: npx playwright install --with-deps chromium
       - run: npm run test:browser -- --shots artifacts/shots
+      - name: Browser audio path (fake microphone, simulated provider)
+        run: npm run test:browser-voice
       - uses: actions/upload-artifact@v4
         if: always()
         with:

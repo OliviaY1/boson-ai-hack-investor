@@ -30,20 +30,33 @@ export function JoinPage() {
   const [info, setInfo] = useState<Info | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [invalid, setInvalid] = useState(false);
+  // The link stops resolving the moment an interview ends; a 404 after a successful load means "closed".
+  const [closed, setClosed] = useState(false);
+  const hadSession = useRef(false);
+  const [voiceLive, setVoiceLive] = useState(false);
   const load = useCallback(async () => {
     try {
       setInfo(await api.get<Info>(`/api/participant/${token}`));
+      hadSession.current = true;
     } catch (e) {
-      if ((e as any).status === 404) setInvalid(true);
+      if ((e as any).status === 404) (hadSession.current ? setClosed : setInvalid)(true);
       else setErr((e as Error).message);
     }
   }, [token]);
   useEffect(() => {
+    if (invalid || closed) return;
     void load();
     const t = setInterval(load, 1500);
     return () => clearInterval(t);
-  }, [load]);
+  }, [load, invalid, closed]);
 
+  // A live voice session stays mounted until its socket closes, so the closing line is heard in full.
+  if (closed && !voiceLive)
+    return (
+      <Shell>
+        <Notice tone="info">This interview has ended. Thank you for your time. You can close this page.</Notice>
+      </Shell>
+    );
   if (invalid)
     return (
       <Shell>
@@ -51,7 +64,7 @@ export function JoinPage() {
       </Shell>
     );
   if (!info) return <Shell>{err ? <Notice tone="bad">{err}</Notice> : <div className="text-muted">Loading…</div>}</Shell>;
-  const ended = info.lifecycle === "ended";
+  const ended = info.lifecycle === "ended" || closed;
   return (
     <Shell>
       {info.localTest ? <Notice tone="warn">Local browser test: you are acting as the respondent. This page has no access to the consultant workspace.</Notice> : null}
@@ -63,7 +76,13 @@ export function JoinPage() {
           <Badge tone={info.consent === "accepted" ? "good" : info.consent === "pending" ? "neutral" : "bad"}>consent {info.consent}</Badge>
         </div>
       </Card>
-      {ended ? <Notice tone="info">This interview has ended. Thank you for your time. You can close this page.</Notice> : info.transport === "browser_ws" ? <VoiceParticipant token={token} info={info} onChange={load} /> : <TypedParticipant token={token} info={info} onChange={load} />}
+      {ended && !voiceLive ? (
+        <Notice tone="info">This interview has ended. Thank you for your time. You can close this page.</Notice>
+      ) : info.transport === "browser_ws" ? (
+        <VoiceParticipant token={token} info={info} onChange={load} onLive={setVoiceLive} />
+      ) : (
+        <TypedParticipant token={token} info={info} onChange={load} />
+      )}
       <Transcript info={info} />
     </Shell>
   );
@@ -116,8 +135,12 @@ function TypedParticipant({ token, info, onChange }: { token: string; info: Info
   );
 }
 
-function VoiceParticipant({ token, info, onChange }: { token: string; info: Info; onChange: () => void }) {
+function VoiceParticipant({ token, info, onChange, onLive }: { token: string; info: Info; onChange: () => void; onLive: (live: boolean) => void }) {
   const [phase, setPhase] = useState<Phase>("idle");
+  useEffect(() => {
+    onLive(phase === "connecting" || phase === "connected");
+  }, [phase, onLive]);
+  useEffect(() => () => onLive(false), [onLive]);
   const [err, setErr] = useState<string | null>(null);
   const [speaking, setSpeaking] = useState(false);
   const [userSpeaking, setUserSpeaking] = useState(false);

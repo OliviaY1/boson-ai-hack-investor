@@ -15,6 +15,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:browser": "tsx tests/e2e/browser-journey.ts",
+    "test:browser-voice": "tsx tests/e2e/browser-voice.ts",
     "db:migrate": "tsx backend/scripts/migrate.ts",
     "demo:seed": "tsx backend/scripts/seed.ts",
     "demo:reset": "tsx backend/scripts/reset.ts",

@@ -80,6 +80,19 @@ describe("planning", () => {
     expect(Object.keys(after.plans)).toEqual(Object.keys(before.plans));
   });
 
+  it("re-planning keeps claims with evidence under their codes and never reuses or duplicates a code", async () => {
+    const before = Object.values(snap(env.svc, pid).claims).filter((c) => c.status === "active");
+    const withEvidence = before.filter((c) => env.svc.db.prepare("SELECT 1 FROM evidence_claim_links WHERE claim_id = ?").get(c.id));
+    expect(withEvidence.length).toBeGreaterThan(0);
+    expect(withEvidence.length).toBeLessThan(before.length);
+    await runPlanner(env.svc.ctx, mock, pid);
+    const all = Object.values(snap(env.svc, pid).claims);
+    const active = all.filter((c) => c.status === "active");
+    expect(new Set(active.map((c) => c.code)).size).toBe(active.length);
+    expect(new Set(all.map((c) => c.code)).size).toBe(all.length);
+    for (const c of withEvidence) expect(active.find((a) => a.id === c.id)?.code).toBe(c.code);
+  });
+
   it("labels heuristic plans for non-fixture content and never invents source passages", async () => {
     const p2 = createProject(env.svc.ctx, { company: "Acme Logistics", objective: "Test growth claims." });
     addThesisDocument(env.svc.ctx, env.svc.config.dataDir, p2, { kind: "pasted", text: "Acme grows revenue 12% a year.\n\nCustomer retention exceeds 95%.\n\nWarehouses run at 70% utilisation." });
@@ -165,42 +178,54 @@ describe("controller loop on the deterministic Northstar operator interview", ()
     expect(q.status).toBe("active");
   });
 
+  it("does not call a scope mismatch a contradiction", async () => {
+    const iid = await startSynthetic(env.svc, pid, "Dana Whitfield");
+    await respond(env.svc, iid); // operator:1: vacancies in one region, not a network turnover rate
+    const vacancies = evidenceRows(iid).find((e) => e.quote.includes("four hygienist positions short"))!;
+    const link = env.svc.db.prepare("SELECT relation, comparability FROM evidence_claim_links WHERE evidence_id = ? AND claim_id = ?").get(vacancies.id, claimByCode("C5").id) as any;
+    expect(link).toEqual({ relation: "challenges", comparability: "unclear" });
+    expect(claimByCode("C5").assessment).toBe("inconclusive");
+  });
+
   it("keeps both sides of conflicting comparable evidence visible and assesses the claim as mixed", async () => {
     const iid = await startSynthetic(env.svc, pid, "Dana Whitfield");
-    await respond(env.svc, iid); // operator:1 challenges C5 on a comparable basis
-    expect(claimByCode("C5").assessment).toBe("contradicted_by_interview");
+    await respond(env.svc, iid);
     const c5 = claimByCode("C5").id;
-    const text = "In 2023 our hygienist turnover was in line with the Ontario average, before the 2024 gaps.";
+    const against = "Across the whole network our 2024 hygienist turnover was about double the Ontario average.";
+    const support = "In 2023 our hygienist turnover was in line with the Ontario average, before the 2024 gaps.";
     mock.controlHook = (env2, p) => {
-      const turn = env2.context.newTurns.find((t) => t.speaker === "expert" && t.text === text);
+      const turn = env2.context.newTurns.find((t) => t.speaker === "expert" && (t.text === against || t.text === support));
       if (!turn) return p;
+      const sup = turn.text === support;
       return {
         ...p,
         observations: [
           {
             ref: "x1",
             turn_id: turn.id,
-            quote: "In 2023 our hygienist turnover was in line with the Ontario average",
-            statement: "Operator reports 2023 turnover in line with the provincial average.",
+            quote: sup ? "In 2023 our hygienist turnover was in line with the Ontario average" : "our 2024 hygienist turnover was about double the Ontario average",
+            statement: sup ? "Operator reports 2023 network turnover in line with the provincial average." : "Operator reports 2024 network turnover about double the provincial average.",
             basis: "direct_observation",
-            period: "2023",
-            population: "Eastern Ontario region",
-            metric: "Hygienist turnover",
+            period: sup ? "2023" : "2024",
+            population: "Northstar network",
+            metric: "Hygienist turnover vs Ontario average",
             unit: null,
             calc_basis: null,
             value: null,
-            claim_links: [{ claim_id: c5, relation: "supports", comparability: "comparable", note: "Same metric and basis." }],
+            claim_links: [{ claim_id: c5, relation: sup ? "supports" : "challenges", comparability: "comparable", note: "Same metric and basis." }],
             supersedes_evidence_ids: [],
             retracts_evidence_ids: [],
           },
         ],
       };
     };
-    await answer(env.svc, iid, text);
+    await answer(env.svc, iid, against);
+    expect(claimByCode("C5").assessment).toBe("contradicted_by_interview");
+    await answer(env.svc, iid, support);
     expect(claimByCode("C5").assessment).toBe("mixed_evidence");
     const syn = buildSynthesis(snap(env.svc, pid)).claims.find((c) => c.claim.code === "C5")!;
     expect(syn.supporting.length).toBe(1);
-    expect(syn.challenging.length).toBeGreaterThan(0);
+    expect(syn.challenging.length).toBeGreaterThan(1); // the earlier regional observation stays visible too
     expect(assessClaim([{ relation: "supports", comparability: "not_comparable", disputed: false, interviewId: "a" }]).assessment).toBe("inconclusive");
   });
 

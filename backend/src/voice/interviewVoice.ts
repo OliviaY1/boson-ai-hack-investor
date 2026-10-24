@@ -31,6 +31,10 @@ export interface VoiceSettings {
   transcriptionModel: string;
   transcriptionTimeoutMs: number;
   ackTimeoutMs?: number;
+  /** response.create sent, no response.created yet: the provider is treated as unresponsive after this. */
+  responseStartTimeoutMs?: number;
+  /** response.created received, no response.done yet. */
+  responseDoneTimeoutMs?: number;
 }
 
 interface Current {
@@ -47,7 +51,16 @@ interface Current {
   drained: boolean;
   interrupted: boolean;
   completionTimer: NodeJS.Timeout | null;
+  providerTimer: NodeJS.Timeout | null;
 }
+
+interface DeferredCommit {
+  hangoverMs: number | null;
+  timer: NodeJS.Timeout;
+}
+
+// While a commit waits for an active generation to finish, give up waiting after this and commit anyway.
+const COMMIT_DEFER_MAX_MS = 3000;
 
 interface PendingCommit {
   turnId: string;
@@ -70,6 +83,14 @@ export class InterviewVoiceSession implements InterviewTransport {
   private seenEvents = new Set<string>();
   private droppedAudioEvents = 0;
   private missingStreak = 0;
+  // Response lifecycle bookkeeping. Responses carry no request id, so correlation relies on never having
+  // more than one response.create outstanding and never creating while any response is active.
+  private pendingCreates = 0;
+  private activeResponses = new Set<string>();
+  private unrequestedResponses = new Set<string>();
+  private unrequestedCount = 0;
+  private deferredCommit: DeferredCommit | null = null;
+  private superseded = false;
   readonly log: { dir: "in" | "out"; type: string; at: number }[] = [];
 
   constructor(
@@ -94,11 +115,19 @@ export class InterviewVoiceSession implements InterviewTransport {
     return this.droppedAudioEvents;
   }
 
+  /** Provider responses this session did not request (cancelled and never forwarded). */
+  get unrequestedResponseCount() {
+    return this.unrequestedCount;
+  }
+
   async start() {
     const iv = getInterview(this.ctx, this.interviewId);
     const expert = this.ctx.db.prepare("SELECT name FROM experts WHERE id = ?").get(iv.expert_id) as any;
     participantJoined(this.ctx, this.interviewId);
-    this.engine.attachTransport(this.interviewId, this);
+    // A rejoin (e.g. a new window, or a reconnect before the old socket's close arrived) replaces the
+    // previous participant session; the old one is released without marking the interview interrupted.
+    const previous = this.engine.attachTransport(this.interviewId, this);
+    if (previous instanceof InterviewVoiceSession && previous !== this) previous.supersede();
     this.sendState("connecting");
     try {
       const resolved = await this.higgs.connect(
@@ -135,8 +164,15 @@ export class InterviewVoiceSession implements InterviewTransport {
     this.pump();
   }
 
+  /** True while the provider may still be generating: a response.create is outstanding or a response is active. */
+  private providerBusy(): boolean {
+    return this.pendingCreates > 0 || this.activeResponses.size > 0;
+  }
+
   private pump() {
-    if (!this.ready || this.current || this.ended) return;
+    // A new response.create can be rejected while another generation is active, and a waiting expert
+    // commit goes first, so nothing new is requested until the provider is idle.
+    if (!this.ready || this.current || this.ended || this.providerBusy() || this.deferredCommit) return;
     while (this.queue.length) {
       const id = this.queue.shift()!;
       const d = this.ctx.db.prepare("SELECT * FROM delivery_attempts WHERE id = ?").get(id) as any;
@@ -163,10 +199,48 @@ export class InterviewVoiceSession implements InterviewTransport {
         drained: false,
         interrupted: false,
         completionTimer: null,
+        providerTimer: null,
       };
+      const c = this.current;
+      this.pendingCreates++;
       this.higgs.send({ type: "response.create", response: { instructions, output_modalities: ["audio"] } });
+      c.providerTimer = setTimeout(() => this.onResponseStartTimeout(c), this.settings.responseStartTimeoutMs ?? 15000);
       return;
     }
+  }
+
+  private onResponseStartTimeout(c: Current) {
+    if (this.current !== c || c.responseId) return;
+    this.pendingCreates = Math.max(0, this.pendingCreates - 1);
+    if (c.interrupted) {
+      // Already recorded as interrupted; the provider never started it, so nothing is left to cancel.
+      this.closeCurrent();
+      return;
+    }
+    const iv = getInterview(this.ctx, this.interviewId);
+    commit(this.ctx, iv.project_id, "delivery.failed", (cs) =>
+      transitionDelivery(this.ctx, cs, c.deliveryId, "failed", { detail: "voice provider did not start the response in time" }),
+    );
+    this.current = null;
+    this.providerUnresponsive("did not start a response");
+  }
+
+  private onResponseDoneTimeout(c: Current) {
+    if (this.current !== c || c.generationDone) return;
+    this.higgs.send({ type: "response.cancel" });
+    const iv = getInterview(this.ctx, this.interviewId);
+    // Some audio may have played: the outcome is unknown, never "completed", and it is not replayed.
+    commit(this.ctx, iv.project_id, "delivery.unknown", (cs) =>
+      transitionDelivery(this.ctx, cs, c.deliveryId, c.interrupted ? "interrupted" : "unknown", { detail: "voice provider did not finish the response in time", actualTranscript: c.transcript || null }),
+    );
+    this.current = null;
+    this.providerUnresponsive("did not finish a response");
+  }
+
+  /** A stalled provider is not waited on forever: the interview becomes interrupted and can be resumed. */
+  private providerUnresponsive(what: string) {
+    this.participant.sendJson({ type: "error", message: `The voice service ${what} in time. The research team can resume the interview.` });
+    this.teardown("provider_unresponsive", true);
   }
 
   private isCurrentAudio(responseId: unknown): boolean {
@@ -185,12 +259,38 @@ export class InterviewVoiceSession implements InterviewTransport {
       this.seenEvents.add(e.event_id);
     }
     const iv = () => getInterview(this.ctx, this.interviewId);
+    const rid = String((e.response as any)?.id ?? (e as any).response_id ?? "");
+    if (rid && this.unrequestedResponses.has(rid)) {
+      // Events of a provider-initiated response are never forwarded or recorded as a delivery.
+      if (e.type === "response.done") {
+        this.unrequestedResponses.delete(rid);
+        this.activeResponses.delete(rid);
+        this.onResponseFinished(rid);
+      } else if (e.type === "response.output_audio.delta") this.droppedAudioEvents++;
+      return;
+    }
     switch (e.type) {
       case "response.created": {
         const c = this.current;
-        const rid = (e.response as any)?.id ?? null;
-        if (!c || c.responseId) return; // a response we did not request
+        if (rid) this.activeResponses.add(rid);
+        if (this.pendingCreates === 0 || !c || c.responseId) {
+          // Not requested by this session (e.g. a provider-initiated reply after a commit). Cancel it so it
+          // cannot occupy the conversation, and never forward its audio.
+          this.unrequestedResponses.add(rid);
+          this.unrequestedCount++;
+          console.warn(`[interview-voice] cancelling a provider response that was not requested (${this.unrequestedCount} so far)`);
+          this.higgs.send({ type: "response.cancel" });
+          return;
+        }
+        this.pendingCreates--;
         c.responseId = rid;
+        if (c.providerTimer) clearTimeout(c.providerTimer);
+        c.providerTimer = setTimeout(() => this.onResponseDoneTimeout(c), this.settings.responseDoneTimeoutMs ?? 90000);
+        if (c.interrupted) {
+          // Interrupted before the provider started it: cancel now and wait for response.done before moving on.
+          this.higgs.send({ type: "response.cancel" });
+          return;
+        }
         const p = iv();
         commit(this.ctx, p.project_id, "delivery.speaking", (cs) => {
           transitionDelivery(this.ctx, cs, c.deliveryId, "speaking", { providerResponseId: rid });
@@ -236,9 +336,11 @@ export class InterviewVoiceSession implements InterviewTransport {
       }
       case "response.done": {
         const c = this.current;
-        const rid = (e.response as any)?.id;
-        if (!c || rid !== c.responseId) return;
+        this.activeResponses.delete(rid);
+        if (!c || rid !== c.responseId) return this.onResponseFinished(rid);
         c.generationDone = true;
+        if (c.providerTimer) clearTimeout(c.providerTimer);
+        c.providerTimer = null;
         const status = (e.response as any)?.status;
         if (c.interrupted) return this.closeCurrent();
         if (status === "failed" || status === "incomplete") {
@@ -271,9 +373,12 @@ export class InterviewVoiceSession implements InterviewTransport {
       case "error": {
         const msg = JSON.stringify((e as any).error ?? e).slice(0, 300);
         console.warn(`[interview-voice] provider error: ${msg}`);
-        if (this.current && !this.current.responseId && Date.now() - this.current.createdAt < 5000) {
-          // response.create was rejected (e.g. a response was already active): mark failed, do not retry blindly.
-          const c = this.current;
+        // Errors about audio input, truncation, or a cancel with nothing active are not a rejected response.create.
+        const aboutOther = /input_audio_buffer|append|commit|truncat|cancel/i.test(msg);
+        const c = this.current;
+        if (c && !c.responseId && !c.interrupted && !aboutOther && Date.now() - c.createdAt < 5000) {
+          // response.create was rejected: mark failed, do not retry blindly.
+          this.pendingCreates = Math.max(0, this.pendingCreates - 1);
           const p = iv();
           commit(this.ctx, p.project_id, "delivery.failed", (cs) => transitionDelivery(this.ctx, cs, c.deliveryId, "failed", { detail: `provider error: ${msg}` }));
           this.closeCurrent();
@@ -352,9 +457,18 @@ export class InterviewVoiceSession implements InterviewTransport {
     this.closeCurrent();
   }
 
+  /** A response that is not the current delivery's (unrequested, or already abandoned) has finished. */
+  private onResponseFinished(_rid: string) {
+    if (this.providerBusy()) return;
+    if (this.deferredCommit) this.flushDeferredCommit();
+    else this.pump();
+  }
+
   private closeCurrent() {
     if (this.current?.completionTimer) clearTimeout(this.current.completionTimer);
+    if (this.current?.providerTimer) clearTimeout(this.current.providerTimer);
     this.current = null;
+    if (this.deferredCommit && !this.providerBusy()) this.flushDeferredCommit();
     this.pump();
     if (!this.current && !this.ended) {
       const iv = getInterview(this.ctx, this.interviewId);
@@ -388,8 +502,12 @@ export class InterviewVoiceSession implements InterviewTransport {
       case "speech_start":
         this.speechStartedAt = new Date().toISOString();
         // Context is the delivery active at speech time, not whichever is current when the transcript arrives.
-        this.speechContextDeliveryId = this.current?.deliveryId ?? lastStartedDelivery(this.ctx, this.interviewId)?.id ?? null;
-        if (this.current && this.current.responseId && !this.current.interrupted) await this.interrupt("participant barge-in", msg.playedMs);
+        // A delivery the provider has not started yet counts as context only once it is speaking.
+        this.speechContextDeliveryId = (this.current?.responseId ? this.current.deliveryId : null) ?? lastStartedDelivery(this.ctx, this.interviewId)?.id ?? null;
+        // Barge-in. A question requested but not yet started is withdrawn too: new input makes it obsolete.
+        // The closing line follows the end of the interview, so it is only stopped once it is audible.
+        const c = this.current;
+        if (c && !c.interrupted && (c.responseId || c.kind !== "closing")) await this.interrupt("participant barge-in", msg.playedMs);
         return;
       case "interrupt":
         if (this.current) await this.interrupt("manual interrupt", msg.playedMs);
@@ -412,6 +530,28 @@ export class InterviewVoiceSession implements InterviewTransport {
   private commitTurn(hangoverMs: number | null) {
     if (!this.capturing()) return;
     if (this.appendedSinceCommit < AUDIO_RATE * 0.1) return; // under 100 ms of audio: nothing to commit
+    if (this.deferredCommit) return; // already waiting; the audio appended since is included
+    if (this.providerBusy()) {
+      // A commit while a generation is active (e.g. the cancelled question after a barge-in) can be
+      // rejected, so wait for response.done; commit anyway if the provider takes too long.
+      const timer = setTimeout(() => this.flushDeferredCommit(), COMMIT_DEFER_MAX_MS);
+      this.deferredCommit = { hangoverMs, timer };
+      return;
+    }
+    this.doCommit(hangoverMs);
+  }
+
+  private flushDeferredCommit() {
+    const d = this.deferredCommit;
+    if (!d) return;
+    clearTimeout(d.timer);
+    this.deferredCommit = null;
+    if (this.ended || !this.capturing()) return;
+    this.doCommit(d.hangoverMs);
+    this.pump();
+  }
+
+  private doCommit(hangoverMs: number | null) {
     this.appendedSinceCommit = 0;
     const iv = getInterview(this.ctx, this.interviewId);
     const contextDeliveryId = this.speechContextDeliveryId ?? lastStartedDelivery(this.ctx, this.interviewId)?.id ?? null;
@@ -468,7 +608,11 @@ export class InterviewVoiceSession implements InterviewTransport {
     const audioEndMs = Math.max(0, Math.round(Math.min(playedMs ?? estimate, forwardedMs)));
     if (c.itemId) this.higgs.send({ type: "conversation.item.truncate", item_id: c.itemId, content_index: 0, audio_end_ms: audioEndMs });
     const iv = getInterview(this.ctx, this.interviewId);
-    commit(this.ctx, iv.project_id, "delivery.interrupted", (cs) => {
+    const state = (this.ctx.db.prepare("SELECT state FROM delivery_attempts WHERE id = ?").get(c.deliveryId) as any)?.state;
+    if (state === "queued") {
+      // Nothing was spoken yet: the request is withdrawn, not interrupted, and no interviewer turn exists.
+      commit(this.ctx, iv.project_id, "delivery.cancelled", (cs) => transitionDelivery(this.ctx, cs, c.deliveryId, "cancelled", { detail: `${detail} before the provider started speaking` }));
+    } else commit(this.ctx, iv.project_id, "delivery.interrupted", (cs) => {
       if (transitionDelivery(this.ctx, cs, c.deliveryId, "interrupted", { playedMs: audioEndMs, detail: `${detail}${playedMs === null ? " (playback position estimated)" : ""}`, actualTranscript: c.transcript || null })) {
         appendTurn(this.ctx, cs, {
           interviewId: this.interviewId,
@@ -481,7 +625,13 @@ export class InterviewVoiceSession implements InterviewTransport {
         });
       }
     });
-    if (c.generationDone || !c.responseId) this.closeCurrent();
+    if (c.generationDone) this.closeCurrent();
+    else if (!c.responseId) {
+      // The provider has not started it yet. Keep the slot so a late response.created is recognised and
+      // cancelled rather than mistaken for the next delivery; stop waiting soon if it never arrives.
+      if (c.providerTimer) clearTimeout(c.providerTimer);
+      c.providerTimer = setTimeout(() => this.onResponseStartTimeout(c), Math.min(2000, this.settings.responseStartTimeoutMs ?? 2000));
+    }
     // Otherwise wait for response.done (cancelled) before issuing another response.create.
   }
 
@@ -523,12 +673,42 @@ export class InterviewVoiceSession implements InterviewTransport {
     else this.teardown(null, false);
   }
 
+  get isSuperseded() {
+    return this.superseded;
+  }
+
+  /** Replaced by a newer participant connection for the same interview: release without interrupting it. */
+  supersede() {
+    if (this.ended) return;
+    this.superseded = true;
+    const c = this.current;
+    if (c) {
+      if (!c.generationDone) this.higgs.send({ type: "response.cancel" });
+      c.interrupted = true;
+      const iv = getInterview(this.ctx, this.interviewId);
+      const state = (this.ctx.db.prepare("SELECT state FROM delivery_attempts WHERE id = ?").get(c.deliveryId) as any)?.state;
+      // Audio may have reached the old window: unknown, not replayed. A request the provider never started
+      // stays queued so the new session can deliver it.
+      if (state === "speaking")
+        commit(this.ctx, iv.project_id, "delivery.unknown", (cs) =>
+          transitionDelivery(this.ctx, cs, c.deliveryId, "unknown", { detail: "participant session replaced by a new connection; playback outcome unknown", actualTranscript: c.transcript || null }),
+        );
+    }
+    this.participant.sendJson({ type: "error", message: "This interview was opened in another window, so this window has been disconnected." });
+    this.teardown(null, false);
+  }
+
   private teardown(interruptReason: string | null, markInterruptedState: boolean) {
     if (this.ended) return;
     this.ended = true;
     if (this.current?.completionTimer) clearTimeout(this.current.completionTimer);
+    if (this.current?.providerTimer) clearTimeout(this.current.providerTimer);
+    if (this.deferredCommit) clearTimeout(this.deferredCommit.timer);
+    this.deferredCommit = null;
     for (const p of this.pending) clearTimeout(p.timer);
     this.engine.detachTransport(this.interviewId, this);
+    // A newer participant session owns the interview now; this session's loss does not interrupt it.
+    if (this.engine.transportFor(this.interviewId)) markInterruptedState = false;
     const now = getInterview(this.ctx, this.interviewId);
     if (now.lifecycle === "ended") {
       // E.g. the participant left during the closing line: its playback outcome is unknown, not completed.

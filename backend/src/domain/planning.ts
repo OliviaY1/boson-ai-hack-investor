@@ -85,7 +85,8 @@ export function applyPlannerProposal(ctx: Ctx, projectId: string, p: PlannerProp
         cs.touch("questions", q.id);
       }
     }
-    let claimN = (db.prepare("SELECT COUNT(*) AS n FROM claims WHERE project_id = ? AND status = 'active'").get(projectId) as any).n;
+    // Codes are never reused: a kept claim keeps its code, and a retired code never names a different assertion.
+    let claimN = (db.prepare("SELECT MAX(CAST(SUBSTR(code, 2) AS INTEGER)) AS n FROM claims WHERE project_id = ?").get(projectId) as any).n ?? 0;
     const claimIdByRef = new Map<string, string>();
     for (const c of p.claims) {
       const id = uid("clm");

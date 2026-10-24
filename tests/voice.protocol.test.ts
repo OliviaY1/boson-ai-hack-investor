@@ -7,7 +7,7 @@ import { OPERATOR_SCRIPT } from "../backend/src/providers/northstarFixture";
 import { CLARIFY_TEXT, INTRO_TEXT } from "../backend/src/providers/prompts";
 import { CopilotVoiceSession } from "../backend/src/voice/copilotVoice";
 import { describeClose } from "../backend/src/voice/higgs";
-import { InterviewVoiceSession } from "../backend/src/voice/interviewVoice";
+import { InterviewVoiceSession, type VoiceSettings } from "../backend/src/voice/interviewVoice";
 import { FakeConn, FakeHiggs, FakeParticipant, type FakeHiggsOptions } from "./fakeHiggs";
 import { expertByName, makeEnv, tick, waitFor, type TestEnv } from "./helpers";
 
@@ -29,9 +29,9 @@ async function voiceSetup(fakeOpts: FakeHiggsOptions = {}, localTest = false) {
   return { fake, mock, svc, projectId, interviewId };
 }
 
-async function joinVoice(s: Awaited<ReturnType<typeof voiceSetup>>) {
+async function joinVoice(s: Awaited<ReturnType<typeof voiceSetup>>, extra: Partial<VoiceSettings> = {}) {
   const part = new FakeParticipant();
-  const session = new InterviewVoiceSession(s.svc.ctx, s.svc.engine, s.interviewId, part, { ...s.svc.voiceSettings()!, ackTimeoutMs: 2000 });
+  const session = new InterviewVoiceSession(s.svc.ctx, s.svc.engine, s.interviewId, part, { ...s.svc.voiceSettings()!, ackTimeoutMs: 2000, ...extra });
   cleanups.push(() => session.onParticipantClosed());
   const connP = s.fake.nextConn();
   await session.start();
@@ -180,7 +180,11 @@ describe("expert interview voice session (application-controlled turns)", () => 
     await waitFor(() => conn.count("response.create") === 2, 3000, "first question");
     conn.respond("r_q1", { done: false });
     await waitFor(() => part.of("speaking").length === 2, 2000, "question speaking");
-    await expertSpeaks(session, conn, "item_u9");
+    const speaks = expertSpeaks(session, conn, "item_u9");
+    // Barge-in cancels the question; the provider confirms with response.done before the commit is sent.
+    await conn.waitFor("response.cancel");
+    conn.send({ type: "response.done", response: { id: "r_q1", status: "cancelled", output: [] } });
+    await speaks;
     s.svc.engine.optOut(s.interviewId);
     expect(getInterview(s.svc.ctx, s.interviewId).lifecycle).toBe("ended");
     expect(getInterview(s.svc.ctx, s.interviewId).consent).toBe("withdrawn");
@@ -192,6 +196,107 @@ describe("expert interview voice session (application-controlled turns)", () => 
     await tick(50);
     expect(conn.count("response.create")).toBe(creates);
     expect(getInterview(s.svc.ctx, s.interviewId).active_slot).toBeNull();
+  });
+
+  it("withdraws a question the provider has not started when the expert speaks, and never gives its late response to the next delivery", async () => {
+    const s = await voiceSetup();
+    const { part, session, conn } = await joinVoice(s);
+    await playNext(conn, part, session, "r_intro", 1);
+    await session.onMessage({ type: "consent", accepted: true });
+    await waitFor(() => conn.count("response.create") === 2, 3000, "first question requested");
+    const q1 = s.svc.db.prepare("SELECT id FROM delivery_attempts WHERE interview_id = ? AND kind = 'question'").get(s.interviewId) as any;
+
+    // The expert starts talking before response.created arrives.
+    const barge = session.onMessage({ type: "speech_start" });
+    await session.onMessage({ type: "playback", event: "flushed", playedMs: 0 });
+    await barge;
+    expect(deliveryState(s.svc, q1.id)).toBe("cancelled");
+    await waitFor(() => conn.count("response.cancel") === 1, 2000, "early cancel");
+    session.onAudio(Buffer.alloc(9600));
+    await session.onMessage({ type: "speech_end", vadHangoverMs: 700 });
+    await tick(50);
+    // The cancelled request may still become an active generation, so the commit waits.
+    expect(conn.count("input_audio_buffer.commit")).toBe(0);
+
+    // The late response.created belongs to the withdrawn question: cancelled, its audio dropped.
+    conn.send({ type: "response.created", response: { id: "r_late", status: "in_progress" } });
+    conn.audio("r_late");
+    await waitFor(() => conn.count("response.cancel") === 2, 2000, "late response cancelled");
+    expect(part.of("audio").filter((m) => m.deliveryId === q1.id).length).toBe(0);
+    conn.send({ type: "response.done", response: { id: "r_late", status: "cancelled", output: [] } });
+    await waitFor(() => conn.count("input_audio_buffer.commit") === 1, 2000, "deferred commit");
+    conn.send({ type: "input_audio_buffer.committed", item_id: "item_u1" });
+    conn.send({ type: "conversation.item.input_audio_transcription.completed", item_id: "item_u1", transcript: OPERATOR_SCRIPT.q_staffing.text });
+
+    // The next question gets its own response; the withdrawn one is never marked delivered.
+    const d2 = await playNext(conn, part, session, "r_q2", 3);
+    const row = s.svc.db.prepare("SELECT state, provider_response_id FROM delivery_attempts WHERE id = ?").get(d2) as any;
+    expect(row).toEqual({ state: "completed", provider_response_id: "r_q2" });
+    expect(deliveryState(s.svc, q1.id)).toBe("cancelled");
+    expect(session.droppedAudio).toBeGreaterThan(0);
+  });
+
+  it("cancels a provider-initiated response, never forwards it, and holds new speech until it has finished", async () => {
+    const s = await voiceSetup();
+    const { part, session, conn } = await joinVoice(s);
+    await playNext(conn, part, session, "r_intro", 1);
+    await session.onMessage({ type: "consent", accepted: true });
+    await playNext(conn, part, session, "r_q1", 2);
+    await expertSpeaks(session, conn, "item_u1");
+    const audioBefore = part.of("audio").length;
+
+    // The provider starts a reply on its own after the commit (application-controlled turns should prevent this).
+    conn.send({ type: "response.created", response: { id: "r_auto", status: "in_progress" } });
+    conn.audio("r_auto");
+    await waitFor(() => conn.count("response.cancel") === 1, 2000, "unrequested response cancelled");
+    expect(session.unrequestedResponseCount).toBe(1);
+    expect(part.of("audio").length).toBe(audioBefore);
+
+    conn.send({ type: "conversation.item.input_audio_transcription.completed", item_id: "item_u1", transcript: OPERATOR_SCRIPT.q_staffing.text });
+    await s.svc.engine.whenIdle(s.interviewId);
+    await tick(100);
+    // The controller has authorized the next question, but nothing is requested while r_auto is active.
+    expect(conn.count("response.create")).toBe(2);
+    conn.send({ type: "response.done", response: { id: "r_auto", status: "cancelled", output: [] } });
+    const d = await playNext(conn, part, session, "r_q2", 3);
+    expect(deliveryState(s.svc, d)).toBe("completed");
+    const fromAuto = s.svc.db.prepare("SELECT COUNT(*) AS n FROM delivery_attempts WHERE provider_response_id = 'r_auto'").get() as any;
+    expect(fromAuto.n).toBe(0);
+  });
+
+  it("treats a provider that never starts a response as unresponsive: the delivery fails and the interview becomes resumable", async () => {
+    const s = await voiceSetup();
+    const { part, conn } = await joinVoice(s, { responseStartTimeoutMs: 300 });
+    await conn.waitFor("response.create");
+    await waitFor(() => getInterview(s.svc.ctx, s.interviewId).lifecycle === "interrupted", 3000, "interrupted");
+    const intro = s.svc.db.prepare("SELECT state, interruption_detail FROM delivery_attempts WHERE interview_id = ? AND kind = 'intro'").get(s.interviewId) as any;
+    expect(intro.state).toBe("failed");
+    expect(intro.interruption_detail).toMatch(/did not start/);
+    expect(part.of("error").at(-1)?.message).toMatch(/resume/);
+    expect(getInterview(s.svc.ctx, s.interviewId).pause_reason).toBe("provider_unresponsive");
+    expect(conn.count("response.create")).toBe(1); // nothing retried blindly
+  });
+
+  it("lets a rejoin supersede the previous participant session without interrupting the interview", async () => {
+    const s = await voiceSetup();
+    const first = await joinVoice(s);
+    await playNext(first.conn, first.part, first.session, "r_intro", 1);
+    await first.session.onMessage({ type: "consent", accepted: true });
+    await waitFor(() => first.conn.count("response.create") === 2, 3000, "first question");
+    first.conn.respond("r_q1", { done: false });
+    await waitFor(() => first.part.of("speaking").length === 2, 2000, "question speaking");
+    const q1 = s.svc.db.prepare("SELECT id FROM delivery_attempts WHERE interview_id = ? AND kind = 'question'").get(s.interviewId) as any;
+
+    const second = await joinVoice(s);
+    expect(first.session.isSuperseded).toBe(true);
+    expect(first.part.of("error").at(-1)?.message).toMatch(/another window/);
+    await waitFor(() => first.part.closed, 1000, "old participant closed");
+    expect(deliveryState(s.svc, q1.id)).toBe("unknown"); // audio may have reached the old window; not replayed as delivered
+    // The old socket's close arriving late changes nothing.
+    first.session.onParticipantClosed();
+    expect(getInterview(s.svc.ctx, s.interviewId).lifecycle).toBe("active");
+    expect(s.svc.engine.transportFor(s.interviewId)).toBe(second.session);
+    expect(second.conn.received.some((m) => m.type === "session.update")).toBe(true);
   });
 
   it("refuses a provider session that does not accept application-controlled turns", async () => {

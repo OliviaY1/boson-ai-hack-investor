@@ -15,6 +15,7 @@ import {
   DELIVERY_LABELS,
   duration,
   human,
+  INTERRUPTION_REASONS,
   LIFECYCLE_LABELS,
   liveInterview,
   when,
@@ -212,6 +213,7 @@ function InterviewView({ iv }: { iv: InterviewRecord }) {
             {iv.localTest ? " · local browser test (consultant acting as respondent)" : ""} · Plan v{iv.planVersion ?? "—"} · Duration {duration(iv.startedAt, iv.endedAt)}
             {iv.terminationReason ? ` · Ended: ${human(iv.terminationReason)}` : ""}
             {iv.pauseReason && iv.lifecycle === "paused" ? ` · Paused: ${human(iv.pauseReason)}` : ""}
+            {iv.pauseReason && iv.lifecycle === "interrupted" ? ` · Interrupted: ${INTERRUPTION_REASONS[iv.pauseReason] ?? human(iv.pauseReason)}` : ""}
           </div>
         </div>
         <div className="flex-1" />

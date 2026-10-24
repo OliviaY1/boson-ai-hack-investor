@@ -28,6 +28,9 @@ export function retireMemory(ctx: Ctx, projectId: string, memoryId: string) {
 export function editMemory(ctx: Ctx, projectId: string, memoryId: string, text: string) {
   const m = ctx.db.prepare("SELECT * FROM project_memory WHERE id = ? AND project_id = ?").get(memoryId, projectId) as any;
   if (!m) throw new DomainError(404, "Memory item not found.", "not_found");
+  if (m.status !== "active") throw new DomainError(409, "Only an active memory item can be corrected.", "invalid_transition");
+  const t = text.trim();
+  if (!t || t.length > 1000) throw new DomainError(400, "Memory text must be 1-1000 characters.", "invalid_input");
   // Corrections keep history: retire the old item and add the corrected one.
   commit(ctx, projectId, "memory.corrected", (cs) => {
     ctx.db.prepare("UPDATE project_memory SET status = 'retired' WHERE id = ?").run(memoryId);

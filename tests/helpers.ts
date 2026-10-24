@@ -23,6 +23,7 @@ export function makeEnv(overrides: Partial<AppConfig> = {}, opts: { real?: Reaso
     bosonApiKey: undefined,
     accessToken: undefined,
     providerTimeoutMs: 5000,
+    callTrace: "off",
     ...overrides,
   });
   const svc = new Services(config, { real: opts.real ?? null, mock: opts.mock });

@@ -1,6 +1,6 @@
 # Build status
 
-Spec: `backend/Diligence_Live_MVP_Brief.md`. Current branch: `claude/relaxed-darwin-45son1` (continues the build merged from `claude/project-thread-si1yt1`).
+Spec: `backend/Diligence_Live_MVP_Brief.md`. Current branch: `claude/relaxed-darwin-45son1` (continues the build merged from `claude/project-thread-si1yt1`). Session 3 added the test-call path: the AI interviewer calls a respondent you play in the browser.
 Legend: **verified** (exercised by a passing check named here), **implemented** (code complete, not exercised end to end), **blocked** (reason given).
 
 ## Checklist
@@ -30,18 +30,21 @@ Legend: **verified** (exercised by a passing check named here), **implemented** 
 | Workspace UI: overview, experts, plan, live research, findings, copilot, participant join page | verified | `npm run test:browser` (Chromium, 10 checks, no console errors) |
 | Browser audio: AudioWorklet capture, energy VAD, PCM playback with drained reports, barge-in flush, closing line | verified with a fake microphone against a simulated provider | `npm run test:browser-voice` (Chromium fake capture device fed a synthetic voice-like WAV; `tests/e2e/simHiggs.ts`). Not a real microphone, speakers, echo, or the real provider |
 | Exclusive microphone ownership between a local participant test and consultant private voice on one device | verified with a fake microphone against a simulated provider | `npm run test:browser-voice` (session 2): claiming private voice stops the respondent tab's capture and pauses the interview; the simulated provider receives no interview audio and no expert turn is created while the consultant holds the mic; stopping voice resumes the interview and the respondent reclaims the mic explicitly |
+| Test calls: `POST /api/calls` starts a call in one step (demo project created once, persona, mode from the configured keys, previous test call replaced, real interviews never displaced); `/call` page; `GET /api/calls/:id` diagnostics with a plain-language `problems` list; terminal call trace (`CALL_TRACE`) | verified (simulated provider and fake microphone) | `http.test.ts` "test calls"; `npm run test:browser-voice` (session 3): open `/call`, press Answer, spoken yes, a question asked by voice, "I have to go, bye", spoken goodbye, diagnostics report no problems |
+| Spoken consent (captured only after the full request; conservative yes/no/unclear; provenance stored) and spoken call endings (goodbye, withdraw) | verified against protocol fixtures | `callSignals.test.ts` (44 phrasings, plus every scripted demo line never ends a call); `voice.protocol.test.ts` "a call answered by voice" (yes, no, unclear twice, speech over the request ignored, goodbye, stop); `state`/`http` typed replies |
 | Northstar deterministic demo (fixtures, six experts, three recommendations, all 10 steps) | verified | `state.test.ts` adaptive demo; browser journey; manual gate 1 through the API |
-| Live Higgs probe script | verified against a simulated endpoint | `npm run probe:live` against `tests/e2e/simHiggs.ts` (session 2): 14 pass, 1 skipped (no Anthropic key) |
+| Live Higgs probe script | verified against a simulated endpoint | `npm run probe:live` against `tests/e2e/simHiggs.ts` (session 3): 15 pass, 1 skipped (no Anthropic key); it now gives consent by voice (`interview_spoken_consent`) |
 | GitHub Actions: credential-free job + live job using the `BOSON_API_KEY` secret | implemented | `.github/workflows/ci.yml` |
 | README, `.env.example` | done | |
 
-## Credential-free acceptance (session 2, all passing)
+## Credential-free acceptance (session 3, all passing)
 
 - `npm run typecheck`: clean.
-- `npm test`: 4 files, 44 tests (three consecutive runs).
+- `npm test`: 5 files, 97 tests (three consecutive runs).
 - `npm run build`: UI bundle and server bundle.
-- `npm run test:browser`: 10 checks; `npm run test:browser-voice`: 11 checks (two repeat runs each). In this container Playwright's pinned browser build is not installed, so both ran with `CHROMIUM_PATH=/opt/pw-browsers/chromium`.
-- Gate 1 by hand against `npm start` on an empty data directory: created a project, uploaded the sample DOCX and CSV, generated the plan (5 claims, all source-linked; 6 rankings quoting stored backgrounds; 3 recommended), edited a question (revision 2 in the approved snapshot and in the DOCX), approved, exported `plan.docx`; seeded Northstar and ran the operator interview through the API with a private copilot directive (it became a neutral follow-up); both findings cite the operator and the customer; flagged the causal finding with next evidence; exported `report.html` (marked synthetic); restarted the backend; both projects were restored at the same state revisions; the copilot answered "Where were we?" with the flag, next steps, and turn-level citations.
+- `npm run test:browser`: 10 checks; `npm run test:browser-voice`: 16 checks, including the full test call from `/call`. In this container Playwright's pinned browser build is not installed, so both ran with `CHROMIUM_PATH=/opt/pw-browsers/chromium`.
+- `npm run probe:live` against the simulated endpoint: 15 pass, 1 skipped (no Anthropic key).
+- Gate 1 by hand (session 2) against `npm start` on an empty data directory: created a project, uploaded the sample DOCX and CSV, generated the plan (5 claims, all source-linked; 6 rankings quoting stored backgrounds; 3 recommended), edited a question (revision 2 in the approved snapshot and in the DOCX), approved, exported `plan.docx`; seeded Northstar and ran the operator interview through the API with a private copilot directive (it became a neutral follow-up); both findings cite the operator and the customer; flagged the causal finding with next evidence; exported `report.html` (marked synthetic); restarted the backend; both projects were restored at the same state revisions; the copilot answered "Where were we?" with the flag, next steps, and turn-level citations.
 
 ## Live verification
 
@@ -50,7 +53,7 @@ Legend: **verified** (exercised by a passing check named here), **implemented** 
 | Higgs live: session ack, speech output, final transcription, controller after final transcript, barge-in, copilot VAD + tool loop | **blocked**: no `BOSON_API_KEY` in this environment. In session 2 `api.boson.ai` became reachable (HTTP 401 without a key), so `BOSON_API_KEY=... npm run probe:live -- --require-key` can now run from here once a key is provided. In CI the "Live Higgs checks" job needs an Actions repository secret named `BOSON_API_KEY`. |
 | Current Boson documentation re-check | **blocked**: `docs.boson.ai` is refused by this environment's proxy and did not resolve from the web-fetch path, so the protocol could not be re-read against the official pages. Third-party integration notes found by search (pipecat-boson, LiveKit plugin) say turn detection is fixed by the first `session.update` (this build sends exactly one) and that the client-driven commit path is less exercised; the session-2 response-lifecycle guards and the probe's "no provider-initiated responses" check cover that risk. |
 | Live expert turn through real Anthropic reasoning | **blocked**: no `ANTHROPIC_API_KEY`. Set it and run `npm run probe:live` (adds a real planner call), then run a *Live voice* interview. |
-| Real microphone and speaker in a browser | **blocked**: needs a human-operated browser with a microphone. Steps: set both keys, `npm run dev`, start a *Live voice* interview, open the participant link in Chrome, accept the mic prompt, answer a question, talk over the next question (playback must stop at once), and open the copilot voice in the same browser to confirm the interview pauses and the mic switches owner. |
+| Real microphone and speaker in a browser | **blocked**: needs a human-operated browser with a microphone. Steps: set both keys, `npm run dev`, open http://localhost:5173/call, press **Answer call**, wait for the question, say "yes", answer a question, talk over the next question (playback must stop at once), then say "Sorry, I have to go, bye" (a spoken goodbye must follow and the call must end). Check **Call diagnostics** for an empty `problems` list. Separately, open the copilot voice in the same browser during a local test interview to confirm the interview pauses and the mic switches owner. |
 
 ## Notes for a continuing session
 

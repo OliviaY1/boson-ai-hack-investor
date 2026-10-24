@@ -368,4 +368,14 @@ CREATE TABLE provider_event_log (
 );
 `,
   },
+  {
+    version: 2,
+    name: "consent_provenance",
+    // How consent was given (spoken answer, on-screen control, scripted demo), which utterance, and when.
+    sql: `
+ALTER TABLE interviews ADD COLUMN consent_method TEXT;
+ALTER TABLE interviews ADD COLUMN consent_turn_id TEXT;
+ALTER TABLE interviews ADD COLUMN consent_at TEXT;
+`,
+  },
 ];

@@ -37,6 +37,8 @@ export interface AppConfig {
   transcriptionTimeoutMs: number;
   providerTimeoutMs: number;
   serveStatic: boolean;
+  /** Terminal timeline of each call: off, on (steps and timings), verbose (also transcript text). */
+  callTrace: "off" | "on" | "verbose";
 }
 
 export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
@@ -64,6 +66,7 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     transcriptionTimeoutMs: Number(env.TRANSCRIPTION_TIMEOUT_MS ?? 12000),
     providerTimeoutMs: Number(env.PROVIDER_TIMEOUT_MS ?? 45000),
     serveStatic: env.SERVE_STATIC !== "false",
+    callTrace: env.CALL_TRACE === "off" || env.CALL_TRACE === "verbose" ? env.CALL_TRACE : "on",
     ...overrides,
   };
   return cfg;

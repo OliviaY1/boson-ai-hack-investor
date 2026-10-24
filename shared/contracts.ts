@@ -61,6 +61,8 @@ export type Lifecycle = (typeof LIFECYCLES)[number];
 export const LIVE_LIFECYCLES: Lifecycle[] = ["awaiting_participant", "consent_pending", "active", "paused"];
 
 export type ConsentState = "pending" | "accepted" | "declined" | "withdrawn";
+/** verbal: the participant's spoken answer to the consent request; control: the on-screen control; scripted: synthetic demo respondent. */
+export type ConsentMethod = "verbal" | "control" | "scripted";
 export type QuestionOrigin = "planner" | "consultant" | "controller" | "copilot";
 export type Speaker = "expert" | "interviewer" | "system";
 
@@ -205,6 +207,9 @@ export interface InterviewRecord {
   transport: "simulated" | "browser_ws" | "fixture";
   lifecycle: Lifecycle;
   consent: ConsentState;
+  consentMethod: ConsentMethod | null;
+  consentTurnId: string | null;
+  consentAt: string | null;
   pauseReason: string | null;
   terminationReason: string | null;
   controlRevision: number;

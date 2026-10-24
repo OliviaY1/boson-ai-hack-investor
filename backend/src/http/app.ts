@@ -23,11 +23,12 @@ import { addDirective, editMemory, markReviewed, rememberInstruction, retireMemo
 import { addQuestion, approvePlan, editClaim, editQuestion, planHasUnapprovedChanges, runPlanner, setRankingSelected } from "../domain/planning";
 import { addExpert, addThesisDocument, createProject, importExperts, removeExpert, requireProject, updateExpert, updateProject } from "../domain/projects";
 import { buildSnapshot, loadProject } from "../domain/records";
+import { callSetup, callStatus, startCall } from "../calls";
 import { buildPlanDocx } from "../export/planDocx";
 import { renderReport } from "../export/report";
 import { parseExpertCsv } from "../ingest/csv";
 import { extractDocxText } from "../ingest/docx";
-import { INTRO_TEXT } from "../providers/prompts";
+import { introText } from "../providers/prompts";
 import type { Services } from "../services";
 import { REPO_ROOT } from "../services";
 import { CopilotVoiceSession } from "../voice/copilotVoice";
@@ -98,7 +99,7 @@ export function createApp(svc: Services) {
       transport: iv.transport,
       lifecycle: iv.lifecycle,
       consent: iv.consent,
-      intro: INTRO_TEXT,
+      intro: introText(expert?.name),
       localTest: !!iv.local_test,
       voiceAvailable: iv.transport === "browser_ws" && !!svc.voiceSettings(),
       transcript: assistantLines,
@@ -156,6 +157,20 @@ export function createApp(svc: Services) {
     const id = await svc.seedNorthstar();
     res.status(201).json({ id });
   });
+
+  // Test calls: the AI interviewer calls a respondent you play in the browser (see backend/src/calls.ts).
+  app.get("/api/calls/setup", async (_req, res) => res.json(await callSetup(svc)));
+  app.post("/api/calls", async (req, res) => {
+    const b = z
+      .object({
+        personaId: z.string().max(60).optional(),
+        persona: z.object({ name: z.string().trim().min(1).max(120), title: z.string().trim().max(200).default(""), background: z.string().trim().min(3).max(2000) }).optional(),
+        voice: z.boolean().default(true),
+      })
+      .parse(req.body ?? {});
+    res.status(201).json(await startCall(svc, b));
+  });
+  app.get("/api/calls/:iid", (req, res) => res.json(callStatus(svc, p(req, "iid"))));
   app.get("/api/projects/:id/snapshot", (req, res) => {
     const s = buildSnapshot(ctx.db, p(req, "id"));
     if (!s) throw new DomainError(404, "Project not found.", "not_found");

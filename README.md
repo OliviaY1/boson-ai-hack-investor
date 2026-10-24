@@ -4,6 +4,37 @@ A supervised investment diligence workspace. It turns an investment thesis into 
 
 The product spec is [`backend/Diligence_Live_MVP_Brief.md`](backend/Diligence_Live_MVP_Brief.md). Build progress and unresolved items are in [`BUILD_STATUS.md`](BUILD_STATUS.md).
 
+## Test a call: the AI interviewer calls you
+
+You play the person who picks up (a customer by default); the AI interviewer introduces itself, asks whether you agree to take part, and interviews you by voice. There is no telephone network in this build: the "phone" is a browser tab on your computer.
+
+```bash
+npm install
+cp .env.example .env    # set BOSON_API_KEY, and ANTHROPIC_API_KEY for real reasoning
+npm run dev             # then open http://localhost:5173/call
+```
+
+On the call page pick who you are, press **Answer call**, and allow the microphone. Use headphones, so the interviewer's voice does not reach your microphone. Then:
+
+1. The interviewer greets you by name, says it is an AI, that the call is transcribed and audio is not recorded, and asks whether you will take part. It cannot be talked over; wait for the question.
+2. Say **"yes"** to start. "No" ends the call with a goodbye; anything unclear is asked again (twice at most).
+3. Answer the questions naturally. A pause of about 0.8 s ends your turn; talking over the interviewer stops it.
+4. Say **"Sorry, I have to go, bye"** to hang up politely, or **"stop the interview"** to withdraw.
+
+Which models run: **Higgs Realtime** (Boson AI, `BOSON_MODEL`, default `higgs-realtime`) hears you, transcribes with `higgs-stt-3.1`, and speaks; **Claude** (`REASONING_MODEL`, default `claude-opus-5-5`) decides each next question and extracts evidence when `ANTHROPIC_API_KEY` is set. With only a Boson key, set `ALLOW_LIVE_VOICE_MOCK_REASONING=true` to test the voice path with scripted reasoning (questions in plan order, answers not understood). **Answer by typing** runs the same call without audio or keys.
+
+While you talk, the backend terminal prints each step of the call (session acknowledged, speech requested and started, your turn committed, transcript received, consent, controller decision and latency, goodbye); `CALL_TRACE=verbose` adds the transcript text, `CALL_TRACE=off` silences it. After the call, **Call diagnostics** on the page (`GET /api/calls/<interviewId>`) returns the transcript, every spoken delivery with its state, controller decisions, latency per stage, the voice protocol event log, and a plain-language `problems` list that names where a failing call broke.
+
+The same thing without the page:
+
+```bash
+curl -s localhost:8787/api/calls/setup                                     # personas, available modes, models
+curl -s -X POST localhost:8787/api/calls -H 'content-type: application/json' -d '{"voice":true}'
+# -> { "joinPath": "/join/…", "statusPath": "/api/calls/int_…", … }   open the joinPath in Chrome and press Join
+```
+
+A test call is an ordinary interview in the fictional Northstar project (created on first use) marked as a local browser test, so it runs through the same controller, validation, persistence, and voice code as any interview, and it appears in the workspace's Live Research view. Starting a new test call ends the previous one; it never displaces a real participant interview.
+
 ## Quick start (no credentials needed)
 
 Requires Node 20+ (CI uses 22).
@@ -82,7 +113,8 @@ consultant copilot ──WS /ws/copilot──▶ CopilotVoiceSession ──WS─
 - Data lives in `DATA_DIR` (default `./data`): `diligence.sqlite` plus uploaded files. Normal startup migrates but never resets or reseeds. On restart, interviews that were live are marked *interrupted* and can be resumed explicitly; completed questions are not replayed.
 - The backend binds to `127.0.0.1` by default. Set `ACCESS_TOKEN` before exposing it beyond loopback; consultant APIs and the copilot WebSocket then require it. This is a basic shared-token gate, not user accounts or SSO; a public or team deployment also needs TLS and an operational authentication setup.
 - Participant links are opaque, expiring, and scoped to one interview. They cannot call consultant APIs and see only their own interview transcript.
-- Interviews start with AI identification and a consent request; substantive questions wait for acceptance. Declining or opting out cancels pending model and audio work and ends the session. **Audio is not recorded**; transcripts are retained, and the consent screen says so.
+- Interviews start with AI identification and a consent request; substantive questions wait for acceptance. Declining or opting out cancels pending model and audio work and ends the session. **Audio is not recorded**; transcripts are retained, and the introduction and consent screen say so.
+- Consent can be spoken (`backend/src/domain/callSignals.ts`). The participant's audio is captured only after the full participation request has played; speech over it is neither captured nor treated as barge-in. A clear yes with no hedging is consent (recorded with method `verbal`, the utterance, and the time; the answer itself is never mined for evidence); a clear no ends the call with a goodbye; anything else is asked again twice, then the call ends without consent. The on-screen buttons still work (method `control`). During the interview, an explicit goodbye at the end of an utterance ("I have to go, bye") ends the call politely and "stop the interview" withdraws consent; these rules are deterministic and deliberately narrow so research answers never end a call.
 - Only one expert interview can be active across the deployment (enforced by a unique database slot, so concurrent starts get one success and one 409).
 
 ## Live verification

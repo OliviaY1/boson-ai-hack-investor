@@ -64,11 +64,30 @@ export function questionResponseInstructions(questionText: string, directive: st
     .join(" ");
 }
 
-export const INTRO_TEXT =
-  "Hello, I'm an AI interviewer working on behalf of a research team. This conversation is transcribed as text for research purposes; audio is not recorded. Please don't share confidential or non-public information. Do you agree to take part? You can stop at any time.";
+/**
+ * Opening line of every interview: AI identification, transcript-retention disclosure, the confidentiality
+ * boundary, the right to stop, and the participation request last, so a spoken yes or no answers it.
+ */
+export function introText(participantName?: string | null): string {
+  const first = participantName?.trim().replace(/^(dr|mr|mrs|ms)\.?\s+/i, "").split(/\s+/)[0];
+  return [
+    `${first ? `Hi ${first}, this` : "Hello, this"} is an AI interviewer calling on behalf of a research team.`,
+    "This conversation is transcribed as text for research purposes; audio is not recorded.",
+    "Please don't share confidential or non-public information, and you can stop at any time.",
+    "Would you be willing to take part in a short research interview?",
+  ].join(" ");
+}
+
+export const INTRO_TEXT = introText(null);
 
 export const CLARIFY_TEXT = "Sorry, I didn't catch that. Could you say it again?";
 export const CLOSING_TEXT = "Thank you, that's everything I wanted to ask. I appreciate your time.";
+/** Spoken consent was not a clear yes or no. */
+export const CONSENT_CLARIFY_TEXT = "Sorry, I didn't quite catch that. Would you like to take part in this short interview? Please say yes or no.";
+export const CONSENT_DECLINED_TEXT = "Understood. Thank you for your time. Goodbye.";
+export const CONSENT_UNCLEAR_END_TEXT = "No problem, I'll let you go for now. Thank you, goodbye.";
+export const LEAVE_TEXT = "Of course. Thank you very much for your time. Goodbye.";
+export const WITHDRAW_TEXT = "Understood, I've stopped the interview and won't ask anything further. Thank you, goodbye.";
 
 export function fixedUtteranceInstructions(text: string): string {
   return `Say exactly the following, naturally, and nothing else: "${text}"`;

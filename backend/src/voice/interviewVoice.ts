@@ -17,6 +17,7 @@ import type { InterviewEngine, InterviewTransport } from "../interview/engine";
 import { CLARIFY_TEXT, fixedUtteranceInstructions, interviewVoiceInstructions, questionResponseInstructions } from "../providers/prompts";
 import { createDelivery } from "../domain/interviews";
 import { AUDIO_RATE, HiggsConnection, interviewSessionConfig, type ServerEvent } from "./higgs";
+import { logVoiceEvent, newVoiceLog, type VoiceLog } from "./trace";
 
 export interface ParticipantChannel {
   sendJson(msg: Record<string, unknown>): void;
@@ -91,7 +92,8 @@ export class InterviewVoiceSession implements InterviewTransport {
   private unrequestedCount = 0;
   private deferredCommit: DeferredCommit | null = null;
   private superseded = false;
-  readonly log: { dir: "in" | "out"; type: string; at: number }[] = [];
+  /** The participation request (intro) has played in full in this session, so a spoken answer to it can be heard. */
+  private consentRequestHeard = false;
 
   constructor(
     private ctx: Ctx,
@@ -101,14 +103,24 @@ export class InterviewVoiceSession implements InterviewTransport {
     private settings: VoiceSettings,
   ) {
     this.higgs = new HiggsConnection(settings.url, settings.apiKey);
+    this.voiceLog = newVoiceLog();
+    engine.voiceLogs.set(interviewId, this.voiceLog);
     this.higgs.on("event", (e: ServerEvent) => this.onServerEvent(e));
-    this.higgs.on("sent", (e: any) => this.log.push({ dir: "out", type: e.type, at: Date.now() }));
+    this.higgs.on("sent", (e: any) => logVoiceEvent(this.voiceLog, "out", String(e.type)));
     this.higgs.on("closed", (c: any) => {
+      this.voiceLog.connected = false;
       if (!c.byUs && !this.ended) {
+        this.trace(`voice provider closed the connection: ${c.message}`);
         this.participant.sendJson({ type: "error", message: c.message });
         this.teardown("provider_disconnected", true);
       }
     });
+  }
+
+  private readonly voiceLog: VoiceLog;
+
+  private trace(message: string, sensitiveDetail?: string) {
+    this.engine.trace(this.interviewId, message, sensitiveDetail);
   }
 
   get droppedAudio() {
@@ -129,14 +141,21 @@ export class InterviewVoiceSession implements InterviewTransport {
     const previous = this.engine.attachTransport(this.interviewId, this);
     if (previous instanceof InterviewVoiceSession && previous !== this) previous.supersede();
     this.sendState("connecting");
+    this.trace(`participant connected; opening ${this.settings.model} voice session`);
+    const t0 = Date.now();
     try {
       const resolved = await this.higgs.connect(
         interviewSessionConfig(this.settings.model, this.settings.voice, this.settings.transcriptionModel, interviewVoiceInstructions(expert.name)),
         this.settings.ackTimeoutMs ?? 10000,
       );
-      const td = (resolved as any)?.audio?.input?.turn_detection;
+      const input = (resolved as any)?.audio?.input;
+      this.voiceLog.connected = true;
+      this.voiceLog.ack = { turnDetection: input && "turn_detection" in input ? input.turn_detection : "(not echoed)", transcription: input?.transcription ?? "(not echoed)" };
+      const td = input?.turn_detection;
       if (td !== undefined && td !== null) throw new Error("Voice provider did not accept application-controlled turns (turn_detection is not null).");
+      this.trace(`voice session acknowledged in ${Date.now() - t0} ms (turn_detection=${JSON.stringify(this.voiceLog.ack.turnDetection)})`);
     } catch (e) {
+      this.trace(`voice session FAILED: ${(e as Error).message}`);
       this.participant.sendJson({ type: "error", message: `Voice unavailable: ${(e as Error).message}` });
       this.teardown("provider_unavailable", true);
       return;
@@ -185,6 +204,7 @@ export class InterviewVoiceSession implements InterviewTransport {
         continue;
       }
       const instructions = d.kind === "question" ? questionResponseInstructions(d.authorized_text, null) : fixedUtteranceInstructions(d.authorized_text);
+      this.trace(`→ requesting speech: ${d.kind}`, `"${d.authorized_text}"`);
       this.current = {
         deliveryId: id,
         kind: d.kind,
@@ -253,7 +273,7 @@ export class InterviewVoiceSession implements InterviewTransport {
   }
 
   private onServerEvent(e: ServerEvent) {
-    this.log.push({ dir: "in", type: e.type, at: Date.now() });
+    logVoiceEvent(this.voiceLog, "in", e.type);
     if (e.event_id) {
       if (this.seenEvents.has(e.event_id)) return; // duplicate provider event
       this.seenEvents.add(e.event_id);
@@ -295,6 +315,7 @@ export class InterviewVoiceSession implements InterviewTransport {
         commit(this.ctx, p.project_id, "delivery.speaking", (cs) => {
           transitionDelivery(this.ctx, cs, c.deliveryId, "speaking", { providerResponseId: rid });
           addMetric(this.ctx, cs, this.interviewId, null, "response_start_ms", Date.now() - c.createdAt);
+          this.trace(`→ speaking ${c.kind} (response started after ${Date.now() - c.createdAt} ms)`);
         });
         this.participant.sendJson({ type: "speaking", deliveryId: c.deliveryId });
         return;
@@ -414,9 +435,11 @@ export class InterviewVoiceSession implements InterviewTransport {
       return ok;
     }).result;
     if (!changed) return;
+    this.trace(`← transcript ${text ? `(${text.length} chars)` : "EMPTY"}${pend ? ` ${Date.now() - pend.committedAt} ms after commit` : " (late)"}`, text ? `"${text}"` : undefined);
     if (!text) return this.onMissingTranscript();
     this.missingStreak = 0;
-    this.engine.onExpertTurnFinal(this.interviewId);
+    this.engine.onExpertTurnFinal(this.interviewId, turn.id);
+    this.sendState("ready"); // consent or lifecycle may have changed (e.g. a spoken yes)
   }
 
   private onMissingTranscript() {
@@ -433,6 +456,8 @@ export class InterviewVoiceSession implements InterviewTransport {
     const c = this.current;
     if (!c) return;
     const iv = getInterview(this.ctx, this.interviewId);
+    if (c.kind === "intro") this.consentRequestHeard = true;
+    this.trace(`✓ ${c.kind} played (${detail})`, c.transcript ? `"${c.transcript}"` : undefined);
     commit(this.ctx, iv.project_id, "delivery.completed", (cs) => {
       if (transitionDelivery(this.ctx, cs, c.deliveryId, "completed", { actualTranscript: c.transcript || null, detail })) {
         appendTurn(this.ctx, cs, {
@@ -483,8 +508,12 @@ export class InterviewVoiceSession implements InterviewTransport {
   // -- participant input ------------------------------------------------------------------------
 
   private capturing(): boolean {
+    if (!this.ready) return false;
     const iv = getInterview(this.ctx, this.interviewId);
-    return this.ready && iv.consent === "accepted" && (iv.lifecycle === "active" || iv.lifecycle === "paused");
+    if (iv.consent === "accepted") return iv.lifecycle === "active" || iv.lifecycle === "paused";
+    // Before consent, listen only for the answer to the participation request: once it has been heard in
+    // full and while nothing is being said. Speech over the request is neither captured nor sent on.
+    return iv.lifecycle === "consent_pending" && this.consentRequestHeard && !this.current;
   }
 
   onAudio(pcm16: Buffer) {
@@ -506,8 +535,13 @@ export class InterviewVoiceSession implements InterviewTransport {
         this.speechContextDeliveryId = (this.current?.responseId ? this.current.deliveryId : null) ?? lastStartedDelivery(this.ctx, this.interviewId)?.id ?? null;
         // Barge-in. A question requested but not yet started is withdrawn too: new input makes it obsolete.
         // The closing line follows the end of the interview, so it is only stopped once it is audible.
+        // The consent request is never cut short: consent requires it to be heard in full.
         const c = this.current;
-        if (c && !c.interrupted && (c.responseId || c.kind !== "closing")) await this.interrupt("participant barge-in", msg.playedMs);
+        const consentPhase = getInterview(this.ctx, this.interviewId).lifecycle === "consent_pending";
+        if (c && !c.interrupted && !consentPhase && (c.responseId || c.kind !== "closing")) {
+          this.trace(`participant barged in over ${c.kind}${c.responseId ? "" : " (not yet started)"}`);
+          await this.interrupt("participant barge-in", msg.playedMs);
+        }
         return;
       case "interrupt":
         if (this.current) await this.interrupt("manual interrupt", msg.playedMs);
@@ -571,6 +605,7 @@ export class InterviewVoiceSession implements InterviewTransport {
     this.speechContextDeliveryId = null;
     this.speechStartedAt = null;
     this.higgs.send({ type: "input_audio_buffer.commit" });
+    this.trace(`← participant turn committed${hangoverMs !== null ? ` (end of speech detected after ${hangoverMs} ms of silence)` : " (manual end of turn)"}; waiting for transcription`);
     const timer = setTimeout(() => this.onTranscriptionTimeout(turnId), this.settings.transcriptionTimeoutMs);
     this.pending.push({ turnId, itemId: null, committedAt: Date.now(), timer });
     this.participant.sendJson({ type: "turn_committed", turnId });

@@ -1,6 +1,6 @@
 // Interview lifecycle, the single-active-interview guard, transcript turns, and delivery attempts.
 import { createHash, randomBytes } from "node:crypto";
-import type { DeliveryState, InterviewMode } from "../../../shared/contracts";
+import type { ConsentMethod, DeliveryState, InterviewMode } from "../../../shared/contracts";
 import { j, now, uid } from "../db/db";
 import { recomputeClaims } from "./evidence";
 import { commit, DomainError, type ChangeSet, type Ctx } from "./events";
@@ -116,12 +116,41 @@ export function participantJoined(ctx: Ctx, interviewId: string) {
   });
 }
 
-export function recordConsent(ctx: Ctx, interviewId: string, accepted: boolean) {
+export interface ConsentProvenance {
+  method: ConsentMethod;
+  /** The participant utterance that gave or refused consent, for a spoken answer. */
+  turnId?: string | null;
+}
+
+export function recordConsent(ctx: Ctx, interviewId: string, accepted: boolean, how: ConsentProvenance = { method: "control" }) {
   const iv = getInterview(ctx, interviewId);
   if (iv.lifecycle !== "consent_pending") throw new DomainError(409, "Consent is not being requested right now.", "invalid_transition");
-  if (!accepted) return endInterview(ctx, interviewId, "consent_declined", "declined");
+  if (!accepted) {
+    setConsentProvenance(ctx, interviewId, how);
+    return endInterview(ctx, interviewId, "consent_declined", "declined");
+  }
   commit(ctx, iv.project_id, "interview.consent", (cs) => {
-    ctx.db.prepare("UPDATE interviews SET consent = 'accepted', lifecycle = 'active', control_revision = control_revision + 1 WHERE id = ?").run(interviewId);
+    // The consent answer itself is not research content: the controller starts after it.
+    const seq = how.turnId ? ((ctx.db.prepare("SELECT seq FROM transcript_turns WHERE id = ?").get(how.turnId) as any)?.seq ?? null) : null;
+    ctx.db
+      .prepare(
+        `UPDATE interviews SET consent = 'accepted', lifecycle = 'active', consent_method = ?, consent_turn_id = ?, consent_at = ?,
+           controller_cursor = MAX(controller_cursor, COALESCE(?, controller_cursor)), control_revision = control_revision + 1 WHERE id = ?`,
+      )
+      .run(how.method, how.turnId ?? null, now(), seq, interviewId);
+    cs.touch("interviews", interviewId);
+  });
+}
+
+/** Records how a consent decision was made (used before ending on a refusal). */
+export function setConsentProvenance(ctx: Ctx, interviewId: string, how: ConsentProvenance) {
+  const iv = getInterview(ctx, interviewId);
+  commit(ctx, iv.project_id, "interview.consent_provenance", (cs) => {
+    // Nothing said before consent is research content, so the controller never reads it.
+    const maxSeq = (ctx.db.prepare("SELECT MAX(seq) AS s FROM transcript_turns WHERE interview_id = ?").get(interviewId) as any).s ?? 0;
+    ctx.db
+      .prepare("UPDATE interviews SET consent_method = ?, consent_turn_id = ?, consent_at = ?, controller_cursor = MAX(controller_cursor, ?) WHERE id = ?")
+      .run(how.method, how.turnId ?? null, now(), maxSeq, interviewId);
     cs.touch("interviews", interviewId);
   });
 }

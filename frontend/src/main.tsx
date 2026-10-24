@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import "./index.css";
 import { AuthGate } from "./pages/AuthGate";
+import { CallPage } from "./pages/Call";
 import { ExpertsPage } from "./pages/Experts";
 import { FindingsPage } from "./pages/Findings";
 import { JoinPage } from "./pages/Join";
@@ -20,6 +21,7 @@ createRoot(document.getElementById("root")!).render(
         <Route path="/join/:token" element={<JoinPage />} />
         <Route element={<AuthGate />}>
           <Route path="/" element={<ProjectsPage />} />
+          <Route path="/call" element={<CallPage />} />
           <Route path="/projects/:projectId" element={<Workspace />}>
             <Route index element={<OverviewPage />} />
             <Route path="experts" element={<ExpertsPage />} />

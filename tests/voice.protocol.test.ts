@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createInterview, getInterview, recordConsent, participantJoined, startInterview } from "../backend/src/domain/interviews";
 import { MockReasoningProvider } from "../backend/src/providers/mock";
 import { OPERATOR_SCRIPT } from "../backend/src/providers/northstarFixture";
-import { CLARIFY_TEXT, INTRO_TEXT } from "../backend/src/providers/prompts";
+import { CLARIFY_TEXT, CONSENT_CLARIFY_TEXT, CONSENT_DECLINED_TEXT, CONSENT_UNCLEAR_END_TEXT, introText, LEAVE_TEXT, WITHDRAW_TEXT } from "../backend/src/providers/prompts";
 import { CopilotVoiceSession } from "../backend/src/voice/copilotVoice";
 import { describeClose } from "../backend/src/voice/higgs";
 import { InterviewVoiceSession, type VoiceSettings } from "../backend/src/voice/interviewVoice";
@@ -82,12 +82,14 @@ describe("expert interview voice session (application-controlled turns)", () => 
 
     // Intro: a fixed, authorized utterance with AI identification and the consent request.
     const intro = await conn.waitFor("response.create");
-    expect(intro.response.instructions).toContain(INTRO_TEXT.slice(0, 40));
-    await playNext(conn, part, session, "r_intro", 1);
+    expect(intro.response.instructions).toContain(introText("Dana Whitfield"));
+    expect(introText("Dana Whitfield")).toMatch(/^Hi Dana, this is an AI interviewer.*audio is not recorded.*Would you be willing to take part/);
 
-    // No audio is forwarded to Higgs before consent.
+    // Nothing is forwarded to Higgs while the participation request is playing.
     session.onAudio(Buffer.alloc(4800));
+    await tick(50);
     expect(conn.count("input_audio_buffer.append")).toBe(0);
+    await playNext(conn, part, session, "r_intro", 1);
 
     await session.onMessage({ type: "consent", accepted: true });
     await waitFor(() => hookCalls === 1, 2000, "controller call");
@@ -312,6 +314,115 @@ describe("expert interview voice session (application-controlled turns)", () => 
     expect(part.of("error")[0]?.message).toMatch(/API key/);
     expect(describeClose(1013, "").message).toMatch(/concurrency/);
     expect(describeClose(4429, "").retryable).toBe(false);
+  });
+});
+
+describe("a call answered by voice: spoken consent and spoken goodbyes", () => {
+  const transcribe = (conn: FakeConn, itemId: string, transcript: string) => conn.send({ type: "conversation.item.input_audio_transcription.completed", item_id: itemId, transcript });
+  async function say(session: InterviewVoiceSession, conn: FakeConn, itemId: string, text: string) {
+    await expertSpeaks(session, conn, itemId);
+    transcribe(conn, itemId, text);
+  }
+  const evidenceFrom = (svc: any, itemId: string) =>
+    (svc.db.prepare("SELECT COUNT(*) AS n FROM evidence e JOIN transcript_turns t ON t.id = e.turn_id WHERE t.input_item_id = ?").get(itemId) as any).n;
+  const speechRequested = (conn: FakeConn, text: string) => conn.waitFor("response.create", (m) => String(m.response?.instructions).includes(text));
+
+  async function consentByVoice(s: Awaited<ReturnType<typeof voiceSetup>>, v: Awaited<ReturnType<typeof joinVoice>>) {
+    await playNext(v.conn, v.part, v.session, "r_intro", 1);
+    await say(v.session, v.conn, "item_yes", "Yes, happy to help.");
+    await waitFor(() => getInterview(s.svc.ctx, s.interviewId).consent === "accepted", 3000, "spoken consent");
+  }
+
+  it("listens for a spoken yes once the request has played, records it, and starts questioning", async () => {
+    const s = await voiceSetup();
+    const v = await joinVoice(s);
+    await consentByVoice(s, v);
+    const iv = getInterview(s.svc.ctx, s.interviewId);
+    const turn = s.svc.db.prepare("SELECT id, seq FROM transcript_turns WHERE input_item_id = 'item_yes'").get() as any;
+    expect(iv.consent_method).toBe("verbal");
+    expect(iv.consent_turn_id).toBe(turn.id);
+    expect(iv.controller_cursor).toBeGreaterThanOrEqual(turn.seq); // the consent answer is not research content
+    const q1 = await playNext(v.conn, v.part, v.session, "r_q1", 2);
+    expect((s.svc.db.prepare("SELECT kind, state FROM delivery_attempts WHERE id = ?").get(q1) as any)).toEqual({ kind: "question", state: "completed" });
+    expect(evidenceFrom(s.svc, "item_yes")).toBe(0);
+    expect(v.part.of("state").some((m) => m.consent === "accepted")).toBe(true);
+  });
+
+  it("a spoken no ends the call with a goodbye and records the refusal", async () => {
+    const s = await voiceSetup();
+    const v = await joinVoice(s);
+    await playNext(v.conn, v.part, v.session, "r_intro", 1);
+    await say(v.session, v.conn, "item_no", "No thanks, I'm not interested.");
+    await speechRequested(v.conn, CONSENT_DECLINED_TEXT);
+    const iv = getInterview(s.svc.ctx, s.interviewId);
+    expect([iv.lifecycle, iv.consent, iv.consent_method, iv.termination_reason]).toEqual(["ended", "declined", "verbal", "consent_declined"]);
+    await playNext(v.conn, v.part, v.session, "r_bye", 2);
+    await waitFor(() => v.part.of("ended").length === 1, 2000, "call closed after the goodbye");
+    expect((s.svc.db.prepare("SELECT COUNT(*) AS n FROM delivery_attempts WHERE interview_id = ? AND kind = 'question'").get(s.interviewId) as any).n).toBe(0);
+    expect(evidenceFrom(s.svc, "item_no")).toBe(0);
+  });
+
+  it("asks again when the answer is unclear, then ends politely without consent", async () => {
+    const s = await voiceSetup();
+    const v = await joinVoice(s);
+    await playNext(v.conn, v.part, v.session, "r_intro", 1);
+    await say(v.session, v.conn, "item_u1", "Hello? Who is this?");
+    await speechRequested(v.conn, CONSENT_CLARIFY_TEXT);
+    await playNext(v.conn, v.part, v.session, "r_c1", 2);
+    await say(v.session, v.conn, "item_u2", "Hmm, what is this about?");
+    await waitFor(() => v.conn.count("response.create") === 3, 3000, "second clarification");
+    await playNext(v.conn, v.part, v.session, "r_c2", 3);
+    await say(v.session, v.conn, "item_u3", "Uh.");
+    await speechRequested(v.conn, CONSENT_UNCLEAR_END_TEXT);
+    const iv = getInterview(s.svc.ctx, s.interviewId);
+    expect([iv.lifecycle, iv.consent, iv.termination_reason]).toEqual(["ended", "pending", "consent_unclear"]);
+    expect((s.svc.db.prepare("SELECT COUNT(*) AS n FROM evidence WHERE interview_id = ?").get(s.interviewId) as any).n).toBe(0);
+  });
+
+  it("never captures or treats as barge-in speech over the consent request", async () => {
+    const s = await voiceSetup();
+    const v = await joinVoice(s);
+    await v.conn.waitFor("response.create");
+    v.conn.respond("r_intro", { done: false });
+    await waitFor(() => v.part.of("speaking").length === 1, 2000, "intro speaking");
+    await v.session.onMessage({ type: "speech_start", playedMs: 300 });
+    v.session.onAudio(Buffer.alloc(9600));
+    await v.session.onMessage({ type: "speech_end", vadHangoverMs: 700 });
+    await tick(100);
+    expect([v.conn.count("response.cancel"), v.conn.count("input_audio_buffer.append"), v.conn.count("input_audio_buffer.commit"), v.part.of("flush").length]).toEqual([0, 0, 0, 0]);
+    v.conn.finish("r_intro");
+    await waitFor(() => v.part.of("audio_done").length === 1, 2000, "intro audio done");
+    await v.session.onMessage({ type: "playback", event: "drained", deliveryId: v.part.of("audio_done")[0].deliveryId });
+    expect((s.svc.db.prepare("SELECT state FROM delivery_attempts WHERE interview_id = ? AND kind = 'intro'").get(s.interviewId) as any).state).toBe("completed");
+  });
+
+  it("saying goodbye mid-interview ends the call politely", async () => {
+    const s = await voiceSetup();
+    const v = await joinVoice(s);
+    await consentByVoice(s, v);
+    await playNext(v.conn, v.part, v.session, "r_q1", 2);
+    await say(v.session, v.conn, "item_bye", "Sorry, I have to go now. Bye.");
+    await speechRequested(v.conn, LEAVE_TEXT);
+    const iv = getInterview(s.svc.ctx, s.interviewId);
+    expect([iv.lifecycle, iv.consent, iv.termination_reason]).toEqual(["ended", "accepted", "participant_ended_call"]);
+    await playNext(v.conn, v.part, v.session, "r_bye", 3);
+    await waitFor(() => v.part.of("ended").length === 1, 2000, "call closed after the goodbye");
+    await s.svc.engine.whenIdle(s.interviewId);
+    expect(evidenceFrom(s.svc, "item_bye")).toBe(0);
+  });
+
+  it("asking to stop withdraws consent and asks nothing further", async () => {
+    const s = await voiceSetup();
+    const v = await joinVoice(s);
+    await consentByVoice(s, v);
+    await playNext(v.conn, v.part, v.session, "r_q1", 2);
+    await say(v.session, v.conn, "item_stop", "Please stop the interview.");
+    await speechRequested(v.conn, WITHDRAW_TEXT);
+    const iv = getInterview(s.svc.ctx, s.interviewId);
+    expect([iv.lifecycle, iv.consent, iv.termination_reason]).toEqual(["ended", "withdrawn", "participant_opt_out"]);
+    await s.svc.engine.whenIdle(s.interviewId);
+    expect(evidenceFrom(s.svc, "item_stop")).toBe(0);
+    expect(v.conn.count("response.create")).toBe(3); // intro, one question, goodbye
   });
 });
 

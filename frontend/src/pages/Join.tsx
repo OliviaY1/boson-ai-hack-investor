@@ -27,6 +27,15 @@ type Phase = "idle" | "connecting" | "connected" | "error" | "closed";
 
 export function JoinPage() {
   const { token = "" } = useParams();
+  return <ParticipantView token={token} />;
+}
+
+/**
+ * The participant's side of an interview. `autoJoin` connects voice immediately (used by the test-call
+ * page, where pressing Answer is the user gesture); `bare` drops the page frame for embedding.
+ */
+export function ParticipantView({ token, autoJoin = false, bare = false }: { token: string; autoJoin?: boolean; bare?: boolean }) {
+  const Frame = bare ? BareFrame : Shell;
   const [info, setInfo] = useState<Info | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [invalid, setInvalid] = useState(false);
@@ -53,20 +62,20 @@ export function JoinPage() {
   // A live voice session stays mounted until its socket closes, so the closing line is heard in full.
   if (closed && !voiceLive)
     return (
-      <Shell>
+      <Frame>
         <Notice tone="info">This interview has ended. Thank you for your time. You can close this page.</Notice>
-      </Shell>
+      </Frame>
     );
   if (invalid)
     return (
-      <Shell>
+      <Frame>
         <Notice tone="bad">This interview link is invalid or has expired. Ask the research team for a new link.</Notice>
-      </Shell>
+      </Frame>
     );
-  if (!info) return <Shell>{err ? <Notice tone="bad">{err}</Notice> : <div className="text-muted">Loading…</div>}</Shell>;
+  if (!info) return <Frame>{err ? <Notice tone="bad">{err}</Notice> : <div className="text-muted">Loading…</div>}</Frame>;
   const ended = info.lifecycle === "ended" || closed;
   return (
-    <Shell>
+    <Frame>
       {info.localTest ? <Notice tone="warn">Local browser test: you are acting as the respondent. This page has no access to the consultant workspace.</Notice> : null}
       <Card title={`Interview with ${info.participantName}`}>
         <p className="text-[15px] leading-relaxed">{info.intro}</p>
@@ -79,13 +88,17 @@ export function JoinPage() {
       {ended && !voiceLive ? (
         <Notice tone="info">This interview has ended. Thank you for your time. You can close this page.</Notice>
       ) : info.transport === "browser_ws" ? (
-        <VoiceParticipant token={token} info={info} onChange={load} onLive={setVoiceLive} />
+        <VoiceParticipant token={token} info={info} onChange={load} onLive={setVoiceLive} autoJoin={autoJoin} />
       ) : (
         <TypedParticipant token={token} info={info} onChange={load} />
       )}
       <Transcript info={info} />
-    </Shell>
+    </Frame>
   );
+}
+
+function BareFrame({ children }: { children: React.ReactNode }) {
+  return <div className="space-y-4">{children}</div>;
 }
 
 function Shell({ children }: { children: React.ReactNode }) {
@@ -112,8 +125,12 @@ function TypedParticipant({ token, info, onChange }: { token: string; info: Info
     <Card title="Synthetic demo participant">
       <p className="mb-3 text-xs text-muted">Fully synthetic mode: no microphone, no audio. Type answers to the questions shown below.</p>
       {info.consent === "pending" ? (
-        <ConsentButtons onAnswer={async (accepted) => { await api.post(`/api/participant/${token}/consent`, { accepted }); onChange(); }} />
-      ) : info.consent === "accepted" ? (
+        <div className="mb-3 space-y-2">
+          <p className="text-sm text-muted">Reply “yes” or “no” below, or use the buttons.</p>
+          <ConsentButtons onAnswer={async (accepted) => { await api.post(`/api/participant/${token}/consent`, { accepted }); onChange(); }} />
+        </div>
+      ) : null}
+      {info.consent === "pending" || info.consent === "accepted" ? (
         <form
           className="space-y-2"
           onSubmit={async (e) => {
@@ -135,7 +152,7 @@ function TypedParticipant({ token, info, onChange }: { token: string; info: Info
   );
 }
 
-function VoiceParticipant({ token, info, onChange, onLive }: { token: string; info: Info; onChange: () => void; onLive: (live: boolean) => void }) {
+function VoiceParticipant({ token, info, onChange, onLive, autoJoin = false }: { token: string; info: Info; onChange: () => void; onLive: (live: boolean) => void; autoJoin?: boolean }) {
   const [phase, setPhase] = useState<Phase>("idle");
   useEffect(() => {
     onLive(phase === "connecting" || phase === "connected");
@@ -189,20 +206,18 @@ function VoiceParticipant({ token, info, onChange, onLive }: { token: string; in
       onLevel: setLevel,
       onSpeechStart: () => {
         setUserSpeaking(true);
-        if (!r.current.consented) return;
+        // Before consent the backend listens for a spoken yes or no, but the request itself is never cut short.
         const cur = player.current;
-        if (player.playing && cur) {
+        if (r.current.consented && player.playing && cur) {
           const played = player.playedMs(cur);
           player.flush(); // barge-in: clear local playback immediately
           sock.send({ type: "speech_start", playedMs: played });
         } else sock.send({ type: "speech_start" });
       },
-      onSpeechFrame: (pcm) => {
-        if (r.current.consented) sock.sendAudio(pcm);
-      },
+      onSpeechFrame: (pcm) => sock.sendAudio(pcm),
       onSpeechEnd: (hangoverMs) => {
         setUserSpeaking(false);
-        if (r.current.consented) sock.send({ type: "speech_end", vadHangoverMs: hangoverMs });
+        sock.send({ type: "speech_end", vadHangoverMs: hangoverMs });
       },
     });
     r.current.cap = cap;
@@ -268,6 +283,19 @@ function VoiceParticipant({ token, info, onChange, onLive }: { token: string; in
     }
   };
 
+  // Test-call page: pressing Answer was the user gesture, so connect straight away. The timer keeps a
+  // development-mode double mount from opening two sessions.
+  const autoJoined = useRef(false);
+  useEffect(() => {
+    if (!autoJoin || autoJoined.current || !info.voiceAvailable) return;
+    const t = setTimeout(() => {
+      autoJoined.current = true;
+      void join();
+    }, 0);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoJoin]);
+
   const consent = async (accepted: boolean) => {
     if (r.current.sock?.open) r.current.sock.send({ type: "consent", accepted });
     else await api.post(`/api/participant/${token}/consent`, { accepted });
@@ -301,7 +329,12 @@ function VoiceParticipant({ token, info, onChange, onLive }: { token: string; in
               <button className="underline" onClick={() => void startCapture().catch((e) => setErr(e.message))}>Reclaim microphone</button>
             </Notice>
           ) : null}
-          {info.consent === "pending" ? <ConsentButtons onAnswer={consent} /> : null}
+          {info.consent === "pending" ? (
+            <div className="space-y-2">
+              <p className="text-sm text-muted">Answer the question out loud: say “yes” to take part or “no” to decline. Or use the buttons.</p>
+              <ConsentButtons onAnswer={consent} />
+            </div>
+          ) : null}
           <div className="flex flex-wrap gap-2">
             <Button onClick={() => { const m = !muted; setMuted(m); if (r.current.cap) r.current.cap.muted = m; }}>{muted ? "Unmute microphone" : "Mute microphone"}</Button>
             <Button onClick={() => { if (r.current.cap?.forceEnd() === false && r.current.consented) r.current.sock?.send({ type: "end_turn" }); }} disabled={info.consent !== "accepted"}>I'm done speaking</Button>

@@ -1,6 +1,7 @@
 // The interview engine: one serialized controller queue per interview, optimistic revision checks,
 // and dispatch of authorized deliveries to the interview's transport (simulated or live browser voice).
 import type { AppConfig } from "../config";
+import { classifyCallEnd, classifyConsent, normalizeUtterance } from "../domain/callSignals";
 import { applyProposal, buildEnvelope, parseProposal, recordFailedDecision, validateProposal } from "../domain/controller";
 import { commit, DomainError, type Ctx } from "../domain/events";
 import {
@@ -13,11 +14,25 @@ import {
   pauseInterview,
   recordConsent,
   resumeInterview,
+  setConsentProvenance,
   transitionDelivery,
+  type ConsentProvenance,
 } from "../domain/interviews";
-import { CLOSING_TEXT, INTRO_TEXT } from "../providers/prompts";
+import {
+  CLOSING_TEXT,
+  CONSENT_CLARIFY_TEXT,
+  CONSENT_DECLINED_TEXT,
+  CONSENT_UNCLEAR_END_TEXT,
+  introText,
+  LEAVE_TEXT,
+  WITHDRAW_TEXT,
+} from "../providers/prompts";
 import type { ReasoningProvider } from "../providers/types";
 import { OPERATOR_DEFAULT, OPERATOR_SCRIPT } from "../providers/northstarFixture";
+import { makeTracer, type Tracer, type VoiceLog } from "../voice/trace";
+
+// After this many unclear answers to the consent request, the call ends politely without consent.
+const MAX_CONSENT_CLARIFICATIONS = 2;
 
 export interface InterviewTransport {
   readonly kind: "simulated" | "browser_ws";
@@ -34,7 +49,10 @@ export class InterviewEngine {
   private queues = new Map<string, Promise<void>>();
   private staleStreak = new Map<string, number>();
   private transports = new Map<string, InterviewTransport>();
+  /** Latest voice protocol log per interview (kept after the session ends, for diagnostics). */
+  readonly voiceLogs = new Map<string, VoiceLog>();
   readonly simulated: SimulatedTransport;
+  readonly trace: Tracer;
 
   constructor(
     readonly ctx: Ctx,
@@ -42,6 +60,7 @@ export class InterviewEngine {
     readonly config: AppConfig,
   ) {
     this.simulated = new SimulatedTransport(this);
+    this.trace = makeTracer(config.callTrace ?? "off");
   }
 
   providerFor(mode: string): ReasoningProvider {
@@ -100,6 +119,7 @@ export class InterviewEngine {
     } catch (e) {
       // A failed provider never falls back to synthetic output; the failure is recorded and visible.
       recordFailedDecision(this.ctx, envelope, provider.name, "error", [(e as Error).message], performance.now() - t0, null);
+      this.trace(interviewId, `controller (${provider.name}) FAILED after ${Math.round(performance.now() - t0)} ms: ${(e as Error).message}`);
       return;
     }
     const providerMs = performance.now() - t0;
@@ -109,6 +129,7 @@ export class InterviewEngine {
       // Nothing from an invalid proposal is applied. One fresh attempt is allowed so a live interview
       // does not stall on a single malformed model response.
       recordFailedDecision(this.ctx, envelope, provider.name, "rejected_invalid", errors, providerMs, raw);
+      this.trace(interviewId, `controller (${provider.name}, ${Math.round(providerMs)} ms) output rejected: ${errors[0] ?? "invalid"}`);
       if (mode === "interview" && !trigger.startsWith("retry_after_invalid")) void this.enqueue(interviewId, `retry_after_invalid(${trigger})`, mode, onlyTurnIds);
       return;
     }
@@ -123,11 +144,21 @@ export class InterviewEngine {
     if (outcome.kind === "stale") {
       const n = (this.staleStreak.get(interviewId) ?? 0) + 1;
       this.staleStreak.set(interviewId, n);
+      this.trace(interviewId, `controller decision was stale (${outcome.reasons[0]}); recomputing`);
       if (n <= 3) void this.enqueue(interviewId, `recompute_after_stale(${trigger})`, mode, onlyTurnIds);
       return;
     }
     this.staleStreak.set(interviewId, 0);
     if (outcome.kind !== "applied") return;
+    if (mode === "interview") {
+      const q = outcome.deliveryId ? (this.ctx.db.prepare("SELECT q.code FROM delivery_attempts d JOIN questions q ON q.id = d.question_id WHERE d.id = ?").get(outcome.deliveryId) as any) : null;
+      const action = outcome.nextAction === "ask" ? `ask ${q?.code ?? "(held: interview not active)"}` : outcome.nextAction;
+      this.trace(
+        interviewId,
+        `controller (${provider.name}, ${Math.round(providerMs)} ms): ${action}; ${parsed.proposal!.observations.length} observation(s), ${parsed.proposal!.coverage_updates.length} coverage update(s)`,
+        `rationale: ${parsed.proposal!.rationale}`,
+      );
+    }
     if (outcome.deliveryId) this.dispatch(interviewId, outcome.deliveryId);
     if (outcome.ended) this.finish(interviewId, "controller_completed");
   }
@@ -143,16 +174,25 @@ export class InterviewEngine {
 
   /** Deliver a closing line (when a transport is connected), then end the interview. */
   finish(interviewId: string, reason: string) {
+    this.endWithGoodbye(interviewId, reason, CLOSING_TEXT);
+  }
+
+  /**
+   * End politely: queue a goodbye line, then end. The generation bump stops all question work and cancels
+   * anything queued, but the goodbye is authorized to play before the session closes.
+   */
+  endWithGoodbye(interviewId: string, reason: string, text: string, consent?: "declined" | "withdrawn") {
     const iv = getInterview(this.ctx, interviewId);
+    if (iv.lifecycle === "ended") return;
     const t = this.transportFor(interviewId);
-    if (t && iv.lifecycle === "active") {
+    if (t && ["consent_pending", "active", "paused"].includes(iv.lifecycle)) {
       const id = commit(this.ctx, iv.project_id, "delivery.closing", (cs) =>
-        createDelivery(this.ctx, cs, interviewId, { kind: "closing", questionId: null, questionRevision: null, text: CLOSING_TEXT, decisionId: null }),
+        createDelivery(this.ctx, cs, interviewId, { kind: "closing", questionId: null, questionRevision: null, text, decisionId: null }),
       ).result;
       t.deliver(id);
     }
-    // Graceful end: the generation bump stops all question work, but the closing line may still play.
-    endInterview(this.ctx, interviewId, reason, undefined, true);
+    endInterview(this.ctx, interviewId, reason, consent, true);
+    this.trace(interviewId, `call ending: ${reason}`);
   }
 
   /** Stop: cancel pending speech and controller work (generation bump), release the guard. */
@@ -170,19 +210,96 @@ export class InterviewEngine {
 
   deliverIntro(interviewId: string) {
     const iv = getInterview(this.ctx, interviewId);
+    const expert = this.ctx.db.prepare("SELECT name FROM experts WHERE id = ?").get(iv.expert_id) as any;
     const id = commit(this.ctx, iv.project_id, "delivery.intro", (cs) =>
-      createDelivery(this.ctx, cs, interviewId, { kind: "intro", questionId: null, questionRevision: null, text: INTRO_TEXT, decisionId: null }),
+      createDelivery(this.ctx, cs, interviewId, { kind: "intro", questionId: null, questionRevision: null, text: introText(expert?.name), decisionId: null }),
     ).result;
     this.dispatch(interviewId, id);
   }
 
-  consent(interviewId: string, accepted: boolean) {
+  /** Consent from the participant's on-screen control (or the scripted demo respondent). */
+  consent(interviewId: string, accepted: boolean, how: ConsentProvenance = { method: "control" }) {
     if (!accepted) {
+      setConsentProvenance(this.ctx, interviewId, how);
       this.stop(interviewId, "consent_declined", true, "declined");
       return;
     }
-    recordConsent(this.ctx, interviewId, true);
+    recordConsent(this.ctx, interviewId, true, how);
+    this.trace(interviewId, `consent accepted (${how.method})`);
     void this.enqueue(interviewId, "consent_accepted");
+  }
+
+  /**
+   * A spoken (or typed) answer while consent is pending. Only a clear yes, after the full participation
+   * request has been delivered, counts as consent; a clear no ends the call with a goodbye; anything
+   * else is asked again a limited number of times.
+   */
+  private onConsentReply(interviewId: string, turnId: string) {
+    const db = this.ctx.db;
+    const text = this.turnText(turnId);
+    const requestHeard = db.prepare("SELECT 1 FROM delivery_attempts WHERE interview_id = ? AND kind = 'intro' AND state = 'completed'").get(interviewId);
+    if (!requestHeard) {
+      // The participation request was not heard in full, so this reply cannot be consent to it.
+      const open = db.prepare("SELECT 1 FROM delivery_attempts WHERE interview_id = ? AND state IN ('queued','speaking')").get(interviewId);
+      if (!open) this.deliverIntro(interviewId);
+      this.trace(interviewId, "reply before the consent request finished; repeating the request");
+      return;
+    }
+    const reply = classifyConsent(text);
+    this.trace(interviewId, `consent reply: ${reply}`, `"${text}"`);
+    if (reply === "yes") {
+      recordConsent(this.ctx, interviewId, true, { method: "verbal", turnId });
+      void this.enqueue(interviewId, "consent_accepted");
+      return;
+    }
+    if (reply === "no") {
+      setConsentProvenance(this.ctx, interviewId, { method: "verbal", turnId });
+      this.endWithGoodbye(interviewId, "consent_declined", CONSENT_DECLINED_TEXT, "declined");
+      return;
+    }
+    const asked = (db.prepare("SELECT COUNT(*) AS n FROM delivery_attempts WHERE interview_id = ? AND kind = 'clarification' AND authorized_text = ?").get(interviewId, CONSENT_CLARIFY_TEXT) as any).n;
+    if (asked >= MAX_CONSENT_CLARIFICATIONS) {
+      this.advanceCursorPast(interviewId, turnId);
+      this.endWithGoodbye(interviewId, "consent_unclear", CONSENT_UNCLEAR_END_TEXT);
+      return;
+    }
+    const iv = getInterview(this.ctx, interviewId);
+    const id = commit(this.ctx, iv.project_id, "delivery.consent_clarification", (cs) =>
+      createDelivery(this.ctx, cs, interviewId, { kind: "clarification", questionId: null, questionRevision: null, text: CONSENT_CLARIFY_TEXT, decisionId: null }),
+    ).result;
+    this.dispatch(interviewId, id);
+  }
+
+  /** The participant explicitly ends the call: a polite goodbye, or a withdrawal of consent. */
+  private participantEndsCall(interviewId: string, kind: "leave" | "withdraw", turnId: string) {
+    this.trace(interviewId, `participant ${kind === "leave" ? "is leaving the call" : "withdrew from the interview"}`);
+    if (kind === "withdraw") {
+      // A request to stop is not research content; nothing more is extracted or asked.
+      this.advanceCursorPast(interviewId, turnId);
+      this.endWithGoodbye(interviewId, "participant_opt_out", WITHDRAW_TEXT, "withdrawn");
+      return;
+    }
+    this.endWithGoodbye(interviewId, "participant_ended_call", LEAVE_TEXT);
+    // A goodbye can carry a last answer ("that's all I know, I have to go"); extract it without asking more.
+    if (normalizeUtterance(this.turnText(turnId)).split(" ").length > 8) void this.enqueue(interviewId, "final_turn", "extract_only", [turnId]);
+    else this.advanceCursorPast(interviewId, turnId);
+  }
+
+  private turnText(turnId: string): string {
+    const r = this.ctx.db
+      .prepare("SELECT v.text FROM transcript_turns t JOIN transcript_versions v ON v.turn_id = t.id AND v.version = t.current_version WHERE t.id = ?")
+      .get(turnId) as any;
+    return String(r?.text ?? "");
+  }
+
+  private advanceCursorPast(interviewId: string, turnId: string) {
+    const iv = getInterview(this.ctx, interviewId);
+    commit(this.ctx, iv.project_id, "interview.cursor", (cs) => {
+      this.ctx.db
+        .prepare("UPDATE interviews SET controller_cursor = MAX(controller_cursor, (SELECT seq FROM transcript_turns WHERE id = ?)) WHERE id = ?")
+        .run(turnId, interviewId);
+      cs.touch("interviews", interviewId);
+    });
   }
 
   optOut(interviewId: string) {
@@ -198,11 +315,22 @@ export class InterviewEngine {
     void this.enqueue(interviewId, "resume");
   }
 
-  onExpertTurnFinal(interviewId: string) {
+  /** A finalized participant utterance. `turnId` identifies it so call-level signals can be read from it. */
+  onExpertTurnFinal(interviewId: string, turnId?: string) {
     const iv = getInterview(this.ctx, interviewId);
     if (iv.lifecycle === "ended") {
-      // Late transcript after termination: extract evidence only; never restart speech.
-      void this.enqueue(interviewId, "late_transcript", "extract_only");
+      // Late transcript after termination: extract evidence only, and only if consent was ever given;
+      // never restart speech.
+      if (iv.consent === "accepted" || iv.consent === "withdrawn") void this.enqueue(interviewId, "late_transcript", "extract_only");
+      return;
+    }
+    if (iv.lifecycle === "consent_pending") {
+      if (turnId) this.onConsentReply(interviewId, turnId);
+      return;
+    }
+    const end = turnId ? classifyCallEnd(this.turnText(turnId)) : null;
+    if (end) {
+      this.participantEndsCall(interviewId, end, turnId!);
       return;
     }
     commit(this.ctx, iv.project_id, "interview.input", (cs) => {
@@ -224,7 +352,8 @@ export class InterviewEngine {
   /** Typed respondent turn (synthetic mode, or a text fallback for a local test). */
   submitTypedTurn(interviewId: string, text: string, sourceEventId: string | null = null): string {
     const iv = getInterview(this.ctx, interviewId);
-    if (!["active", "paused", "ended"].includes(iv.lifecycle)) throw new DomainError(409, "The interview is not accepting answers right now.", "invalid_transition");
+    // consent_pending: a typed yes or no answers the participation request, as a spoken one would.
+    if (!["consent_pending", "active", "paused", "ended"].includes(iv.lifecycle)) throw new DomainError(409, "The interview is not accepting answers right now.", "invalid_transition");
     const t = text.trim();
     if (!t || t.length > 4000) throw new DomainError(400, "The answer must be 1-4000 characters.", "invalid_input");
     const ctxDelivery = lastStartedDelivery(this.ctx, interviewId);
@@ -239,7 +368,7 @@ export class InterviewEngine {
         contextDeliveryId: ctxDelivery?.id ?? null,
       }),
     ).result;
-    if (!duplicate) this.onExpertTurnFinal(interviewId);
+    if (!duplicate) this.onExpertTurnFinal(interviewId, id);
     return id;
   }
 
@@ -248,7 +377,7 @@ export class InterviewEngine {
     const iv = getInterview(this.ctx, interviewId);
     if (iv.transport !== "simulated") throw new DomainError(409, "Scripted responses are only available in the synthetic demo.", "not_synthetic");
     if (iv.lifecycle === "consent_pending") {
-      this.consent(interviewId, true);
+      this.consent(interviewId, true, { method: "scripted" });
       return { action: "consent_accepted" };
     }
     if (iv.lifecycle !== "active") throw new DomainError(409, `The interview is ${iv.lifecycle}.`, "invalid_transition");

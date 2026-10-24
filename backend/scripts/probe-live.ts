@@ -214,11 +214,14 @@ async function main() {
   // 1. Speech fixtures from Higgs itself.
   const expertLine = "In mid twenty twenty four we were about four hygienist positions short across my eleven clinics, so some chairs sat empty most weeks.";
   const consultantLine = "Where were we on this project?";
+  const consentLine = "Yes, I'm happy to take part.";
   let expert: Awaited<ReturnType<typeof synthesize>>;
   let consultant: Awaited<ReturnType<typeof synthesize>>;
+  let consentSpeech: Awaited<ReturnType<typeof synthesize>>;
   try {
     expert = await synthesize(expertLine);
     consultant = await synthesize(consultantLine);
+    consentSpeech = await synthesize(consentLine);
     const ok = expert.pcm.length > AUDIO_RATE && consultant.pcm.length > AUDIO_RATE / 2;
     record({
       name: "higgs_speech_output",
@@ -247,7 +250,7 @@ async function main() {
   try {
     const { id: projectId } = await post("/api/demo/northstar");
     const expertId = (svc.db.prepare("SELECT id FROM experts WHERE project_id = ? AND name = 'Dana Whitfield'").get(projectId) as any).id;
-    await interviewChecks(svc, post, ws, projectId, expertId, expert, expertLine);
+    await interviewChecks(svc, post, ws, projectId, expertId, expert, expertLine, consentSpeech);
     await copilotChecks(svc, ws, projectId, consultant, consultantLine);
     if (svc.capabilities().reasoningProvider === "anthropic") {
       const t0 = Date.now();
@@ -270,7 +273,16 @@ async function main() {
   return finish(startedAt, endpoint);
 }
 
-async function interviewChecks(svc: any, post: (p: string, b?: unknown) => Promise<any>, ws: string, projectId: string, expertId: string, expert: { pcm: Buffer }, expertLine: string) {
+async function interviewChecks(
+  svc: any,
+  post: (p: string, b?: unknown) => Promise<any>,
+  ws: string,
+  projectId: string,
+  expertId: string,
+  expert: { pcm: Buffer },
+  expertLine: string,
+  consentSpeech: { pcm: Buffer },
+) {
   const db = svc.db;
   const { id: iid } = await post(`/api/projects/${projectId}/interviews`, { expertId, mode: "live_voice_mock_reasoning" });
   const { joinToken } = await post(`/api/projects/${projectId}/interviews/${iid}/start`);
@@ -300,8 +312,24 @@ async function interviewChecks(svc: any, post: (p: string, b?: unknown) => Promi
     const intro = await c.wait((m) => m.type === "audio_done", 30000, "intro audio");
     const introDelivery = db.prepare("SELECT kind FROM delivery_attempts WHERE id = ?").get(intro.deliveryId) as any;
     record({ name: "interview_intro_audio", status: introDelivery?.kind === "intro" && (audioFor.get(intro.deliveryId) ?? 0) > 0 ? "pass" : "fail", ms: Date.now() - t0, detail: `intro delivered with ${audioFor.get(intro.deliveryId) ?? 0} audio chunks` });
+    // Spoken consent, as on a phone call: the participant answers the participation request out loud.
     await sleep(300);
-    c.send({ type: "consent", accepted: true });
+    const tConsent = Date.now();
+    c.send({ type: "speech_start" });
+    await stream(c.ws, consentSpeech.pcm, 200);
+    c.send({ type: "speech_end", vadHangoverMs: 500 });
+    const consented = await waitDb(() => (db.prepare("SELECT consent FROM interviews WHERE id = ?").get(iid) as any)?.consent === "accepted", 20000);
+    const civ = db.prepare("SELECT consent, consent_method, consent_turn_id FROM interviews WHERE id = ?").get(iid) as any;
+    const heard = civ?.consent_turn_id
+      ? (db.prepare("SELECT v.text FROM transcript_versions v JOIN transcript_turns t ON t.id = v.turn_id AND v.version = t.current_version WHERE t.id = ?").get(civ.consent_turn_id) as any)?.text
+      : (db.prepare("SELECT v.text FROM transcript_turns t JOIN transcript_versions v ON v.turn_id = t.id AND v.version = t.current_version WHERE t.interview_id = ? AND t.speaker = 'expert' ORDER BY t.seq DESC LIMIT 1").get(iid) as any)?.text;
+    record({
+      name: "interview_spoken_consent",
+      status: consented && civ.consent_method === "verbal" ? "pass" : "fail",
+      ms: Date.now() - tConsent,
+      detail: consented ? `consent accepted from the spoken answer "${heard ?? ""}"` : `no consent after the spoken answer (heard: ${JSON.stringify(heard ?? null)}); continuing with the on-screen control`,
+    });
+    if (!consented) c.send({ type: "consent", accepted: true });
     const q1 = await c.wait((m) => m.type === "audio_done" && m.deliveryId !== intro.deliveryId, 30000, "first question audio");
     await waitDb(() => (db.prepare("SELECT state FROM delivery_attempts WHERE id = ?").get(q1.deliveryId) as any)?.state === "completed", 5000);
     const q1row = db.prepare("SELECT d.state, d.authorized_text, d.actual_transcript, q.fixture_key FROM delivery_attempts d LEFT JOIN questions q ON q.id = d.question_id WHERE d.id = ?").get(q1.deliveryId) as any;

@@ -22,6 +22,7 @@ async function boot(overrides: Partial<AppConfig> = {}): Promise<Running> {
     accessToken: undefined,
     serveStatic: false,
     providerTimeoutMs: 5000,
+    callTrace: "off",
     ...overrides,
   });
   const out = { ...r, base: `http://127.0.0.1:${r.port}`, dir };
@@ -216,5 +217,78 @@ describe("uploads, exports, and concurrency over HTTP", () => {
     expect(items.find((m) => m.id === mid).status).toBe("retired");
     expect(items.filter((m) => m.status === "active").map((m) => m.text)).toContain("Exclude clinics acquired after June 2024.");
     expect((await patch(mid, "A correction of a retired item.")).status).toBe(409);
+  });
+});
+
+describe("test calls (POST /api/calls)", () => {
+  const getJson = async (r: Running, path: string) => (await (await fetch(r.base + path)).json()) as any;
+  const postJson = async (r: Running, path: string, body: unknown = {}) => {
+    const res = await fetch(r.base + path, json(body));
+    return { status: res.status, body: (await res.json()) as any };
+  };
+
+  it("prepares a call in one step, explains missing voice keys, and runs a typed call from consent to goodbye", async () => {
+    const r = await boot();
+    const setup = await getJson(r, "/api/calls/setup");
+    const def = setup.personas.find((p: any) => p.isDefault);
+    expect(def.name).toBe("Priya Raman"); // a customer by default
+    expect(setup.modes.voice).toMatchObject({ available: false, requirement: expect.stringMatching(/BOSON_API_KEY/) });
+    expect((await getJson(r, "/api/calls/setup")).projectId).toBe(setup.projectId); // the demo project is reused, not reseeded
+
+    const voice = await postJson(r, "/api/calls", { voice: true });
+    expect(voice.status).toBe(409);
+    expect(voice.body.error).toMatch(/BOSON_API_KEY/);
+
+    const call = await postJson(r, "/api/calls", { voice: false });
+    expect(call.status).toBe(201);
+    expect(call.body).toMatchObject({ mode: "synthetic", persona: { name: "Priya Raman" }, joinPath: expect.stringMatching(/^\/join\//) });
+    const token = call.body.joinToken;
+    const status = () => getJson(r, call.body.statusPath);
+    expect((await status()).turns[0]).toMatchObject({ speaker: "interviewer", text: expect.stringMatching(/^Hi Priya, this is an AI interviewer/) });
+
+    // Typed replies follow the same path as spoken ones.
+    await fetch(`${r.base}/api/participant/${token}/answer`, json({ text: "Yes, go ahead." }));
+    await fetch(`${r.base}/api/projects/${call.body.projectId}/interviews/${call.body.interviewId}/idle`);
+    let st = await status();
+    expect(st.interview).toMatchObject({ consent: "accepted", consentMethod: "verbal", lifecycle: "active" });
+    expect(st.summary.questionsSpoken).toBe(1);
+    await fetch(`${r.base}/api/participant/${token}/answer`, json({ text: "The clinic cancelled my hygiene appointments three times, so I moved my family elsewhere." }));
+    await fetch(`${r.base}/api/projects/${call.body.projectId}/interviews/${call.body.interviewId}/idle`);
+    await fetch(`${r.base}/api/participant/${token}/answer`, json({ text: "Sorry, I have to go now. Bye." }));
+    st = await status();
+    expect(st.interview).toMatchObject({ lifecycle: "ended", terminationReason: "participant_ended_call" });
+    expect(st.deliveries.at(-1)).toMatchObject({ kind: "closing", state: "completed" });
+    expect(st.summary.observations).toBeGreaterThan(0);
+    expect(st.summary.problems).toEqual([]);
+    expect(st.decisions.length).toBeGreaterThan(0);
+    expect(st.models.reasoning.provider).toBe("mock");
+  });
+
+  it("replaces a previous test call but never displaces a real participant interview", async () => {
+    const r = await boot();
+    const first = await postJson(r, "/api/calls", { voice: false });
+    const second = await postJson(r, "/api/calls", { voice: false });
+    expect(second.status).toBe(201);
+    expect((await getJson(r, first.body.statusPath)).interview).toMatchObject({ lifecycle: "ended", terminationReason: "replaced_by_new_test_call" });
+    await fetch(`${r.base}/api/projects/${second.body.projectId}/interviews/${second.body.interviewId}/stop`, json({}));
+
+    const projectId = second.body.projectId;
+    const snap = (await getJson(r, `/api/projects/${projectId}/snapshot`)).snapshot;
+    const dana = (Object.values(snap.experts) as any[]).find((e) => e.name === "Dana Whitfield").id;
+    const real = (await postJson(r, `/api/projects/${projectId}/interviews`, { expertId: dana, mode: "synthetic", localTest: false })).body.id;
+    await postJson(r, `/api/projects/${projectId}/interviews/${real}/start`);
+    const blocked = await postJson(r, "/api/calls", { voice: false });
+    expect(blocked.status).toBe(409);
+    expect(blocked.body.code).toBe("interview_already_active");
+  });
+
+  it("lets you play someone else and reuses that persona on the next call", async () => {
+    const r = await boot();
+    const persona = { name: "Sam Patel", title: "Patient at the Ottawa clinic", background: "Patient at the Northstar Ottawa clinic since 2020; two children." };
+    const a = await postJson(r, "/api/calls", { voice: false, persona });
+    expect(a.body.persona).toMatchObject({ name: "Sam Patel", title: "Patient at the Ottawa clinic" });
+    const b = await postJson(r, "/api/calls", { voice: false, persona });
+    expect(b.body.persona.id).toBe(a.body.persona.id);
+    expect((await postJson(r, "/api/calls", { voice: false, persona: { name: "", background: "x" } })).status).toBe(400);
   });
 });

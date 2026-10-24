@@ -147,6 +147,32 @@ async function main() {
     await until(() => sim.stats.appends.interview > frozenAppends, 30000, "respondent audio after reclaiming the microphone");
     check(true, "stopping private voice resumes the interview; the respondent reclaims the microphone explicitly");
     await post(`/api/projects/${id}/interviews/${local.id}/stop`, { reason: "test complete" });
+
+    // --- The pitch: open /call, answer, agree out loud, answer a question, and say goodbye.
+    sim.queueTranscripts([
+      "Yes, sure, happy to help.",
+      "My hygiene appointments kept getting cancelled, so I moved my family to another dentist.",
+      "Sorry, I have to go now. Bye.",
+    ]);
+    const ctx3 = await browser.newContext();
+    await ctx3.grantPermissions(["microphone"], { origin: base });
+    const caller = await ctx3.newPage();
+    caller.on("pageerror", (e) => errors.push(String(e)));
+    caller.on("console", (m) => m.type() === "error" && !/status of 404/.test(m.text()) && errors.push(m.text()));
+    await caller.goto(`${base}/call`);
+    await caller.getByRole("button", { name: "Answer call" }).click({ timeout: 20000 });
+    const callIv = () => svc.db.prepare("SELECT * FROM interviews WHERE local_test = 1 ORDER BY created_at DESC LIMIT 1").get() as any;
+    const callDeliveries = () => svc.db.prepare("SELECT kind, state FROM delivery_attempts WHERE interview_id = ? ORDER BY queued_at").all(callIv().id) as any[];
+    await until(() => callIv()?.id !== local.id && callIv().lifecycle === "ended" && callDeliveries().every((d) => d.state !== "queued" && d.state !== "speaking"), 120000, "the test call to end");
+    const iv3 = callIv();
+    check(iv3.consent === "accepted" && iv3.consent_method === "verbal", "test call: the respondent agreed out loud and spoken consent was recorded");
+    check(callDeliveries().some((d) => d.kind === "question" && (d.state === "completed" || d.state === "interrupted")), "test call: the AI interviewer asked a research question by voice");
+    const closing = callDeliveries().at(-1);
+    check(iv3.termination_reason === "participant_ended_call" && closing?.kind === "closing" && closing.state !== "cancelled", "test call: saying goodbye ended the call with a spoken goodbye");
+    const diag = (await (await fetch(`${base}/api/calls/${iv3.id}`)).json()) as any;
+    check(diag.summary.problems.length === 0 && diag.voice?.ack?.turnDetection === null, `test call: diagnostics report no problems${diag.summary.problems.length ? `: ${diag.summary.problems.join(" | ")}` : ""}`);
+    await caller.waitForSelector("text=This interview has ended", { timeout: 15000 });
+    check(true, "test call: the call page shows the call has ended");
     check(errors.length === 0, `no page errors${errors.length ? `: ${errors.join(" | ")}` : ""}`);
   } finally {
     await browser.close();

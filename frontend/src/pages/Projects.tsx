@@ -35,8 +35,10 @@ export function ProjectsPage() {
       <TopBar />
       <main className="mx-auto grid max-w-6xl gap-6 px-6 py-6 lg:grid-cols-[1fr_380px]">
         <div className="space-y-4">
-          <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
             <h1 className="text-xl font-semibold">Projects</h1>
+            <div className="flex-1" />
+            <Button onClick={() => nav("/call")}>Test a call</Button>
             <ActionButton
               variant="primary"
               action={async () => {

@@ -18,9 +18,18 @@ export interface SimStats {
   appends: { interview: number; copilot: number };
 }
 
-export function startSimHiggs(opts: { expertTranscript: string; consultantTranscript?: string }): Promise<{ url: string; stats: SimStats; close: () => Promise<void> }> {
+export interface SimHiggs {
+  url: string;
+  stats: SimStats;
+  /** Transcripts for the next interview commits, in order; afterwards `expertTranscript` is used again. */
+  queueTranscripts: (lines: string[]) => void;
+  close: () => Promise<void>;
+}
+
+export function startSimHiggs(opts: { expertTranscript: string; consultantTranscript?: string }): Promise<SimHiggs> {
   const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
   const stats: SimStats = { appends: { interview: 0, copilot: 0 } };
+  const queued: string[] = [];
   let seq = 0;
   const id = (p: string) => `${p}_${++seq}`;
   const chunk = tone(100);
@@ -87,7 +96,7 @@ export function startSimHiggs(opts: { expertTranscript: string; consultantTransc
         case "conversation.item.truncate":
           return send({ type: "conversation.item.truncated", item_id: e.item_id, audio_end_ms: e.audio_end_ms });
         case "input_audio_buffer.commit":
-          return userTurn(opts.expertTranscript);
+          return userTurn(queued.shift() ?? opts.expertTranscript);
         case "input_audio_buffer.append": {
           const serverVad = session?.audio?.input?.turn_detection?.type === "server_vad";
           stats.appends[serverVad ? "copilot" : "interview"]++;
@@ -118,7 +127,7 @@ export function startSimHiggs(opts: { expertTranscript: string; consultantTransc
   return new Promise((resolve) =>
     wss.on("listening", () => {
       const addr = wss.address() as { port: number };
-      resolve({ url: `ws://127.0.0.1:${addr.port}`, stats, close: () => new Promise<void>((r) => wss.close(() => r())) });
+      resolve({ url: `ws://127.0.0.1:${addr.port}`, stats, queueTranscripts: (lines) => queued.push(...lines), close: () => new Promise<void>((r) => wss.close(() => r())) });
     }),
   );
 }

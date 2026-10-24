@@ -32,6 +32,14 @@ export const LIFECYCLE_LABELS: Record<Lifecycle, string> = {
   interrupted: "Interrupted (resumable)",
 };
 
+export const INTERRUPTION_REASONS: Record<string, string> = {
+  backend_restart: "the backend restarted",
+  participant_disconnected: "the participant disconnected",
+  provider_disconnected: "the voice provider closed the connection",
+  provider_unavailable: "the voice provider could not start a session",
+  provider_unresponsive: "the voice provider stopped responding",
+};
+
 export type Tone = "neutral" | "accent" | "good" | "warn" | "bad" | "info";
 
 export const ASSESSMENT_TONE: Record<Assessment, Tone> = {

@@ -204,4 +204,17 @@ describe("uploads, exports, and concurrency over HTTP", () => {
     expect(ids[1]).toBe(cursor + 2);
     expect(buf).toContain("memory.added");
   });
+
+  it("corrects a project instruction by retiring the old item, and rejects empty or stale corrections", async () => {
+    const r = await boot();
+    const { id } = await seeded(r);
+    const patch = (mid: string, text: string) => fetch(`${r.base}/api/projects/${id}/memory/${mid}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ text }) });
+    const { id: mid } = (await (await fetch(`${r.base}/api/projects/${id}/memory`, json({ text: "Exclude clinics acquired after 2024." }))).json()) as any;
+    expect((await patch(mid, "   ")).status).toBe(400);
+    expect((await patch(mid, "Exclude clinics acquired after June 2024.")).status).toBe(200);
+    const items = Object.values(((await (await fetch(`${r.base}/api/projects/${id}/snapshot`)).json()) as any).snapshot.memory) as any[];
+    expect(items.find((m) => m.id === mid).status).toBe("retired");
+    expect(items.filter((m) => m.status === "active").map((m) => m.text)).toContain("Exclude clinics acquired after June 2024.");
+    expect((await patch(mid, "A correction of a retired item.")).status).toBe(409);
+  });
 });

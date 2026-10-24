@@ -13,8 +13,14 @@ function tone(ms: number) {
   return b.toString("base64");
 }
 
-export function startSimHiggs(opts: { expertTranscript: string; consultantTranscript?: string }): Promise<{ url: string; close: () => Promise<void> }> {
+/** Audio appends received, by session type: lets a test see which session the browser's microphone feeds. */
+export interface SimStats {
+  appends: { interview: number; copilot: number };
+}
+
+export function startSimHiggs(opts: { expertTranscript: string; consultantTranscript?: string }): Promise<{ url: string; stats: SimStats; close: () => Promise<void> }> {
   const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+  const stats: SimStats = { appends: { interview: 0, copilot: 0 } };
   let seq = 0;
   const id = (p: string) => `${p}_${++seq}`;
   const chunk = tone(100);
@@ -83,7 +89,9 @@ export function startSimHiggs(opts: { expertTranscript: string; consultantTransc
         case "input_audio_buffer.commit":
           return userTurn(opts.expertTranscript);
         case "input_audio_buffer.append": {
-          if (session?.audio?.input?.turn_detection?.type !== "server_vad") return;
+          const serverVad = session?.audio?.input?.turn_detection?.type === "server_vad";
+          stats.appends[serverVad ? "copilot" : "interview"]++;
+          if (!serverVad) return;
           const b = Buffer.from(e.audio, "base64");
           let sum = 0;
           for (let i = 0; i + 1 < b.length; i += 2) sum += Math.abs(b.readInt16LE(i));
@@ -110,7 +118,7 @@ export function startSimHiggs(opts: { expertTranscript: string; consultantTransc
   return new Promise((resolve) =>
     wss.on("listening", () => {
       const addr = wss.address() as { port: number };
-      resolve({ url: `ws://127.0.0.1:${addr.port}`, close: () => new Promise<void>((r) => wss.close(() => r())) });
+      resolve({ url: `ws://127.0.0.1:${addr.port}`, stats, close: () => new Promise<void>((r) => wss.close(() => r())) });
     }),
   );
 }

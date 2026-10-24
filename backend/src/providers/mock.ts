@@ -247,7 +247,14 @@ const SCRIPTED: Record<string, ScriptedExtraction> = {
         metric: "Unfilled hygienist positions",
         unit: "positions",
         value: "4",
-        links: [{ claim: "C5", relation: "challenges", comparability: "comparable", note: "Direct report of persistent vacancies conflicts with 'staffing is stable'." }],
+        links: [
+          {
+            claim: "C5",
+            relation: "challenges",
+            comparability: "unclear",
+            note: "Persistent vacancies in one region (11 of 42 clinics) challenge 'staffing is stable' there, but this is a vacancy count, not a turnover rate against the Ontario average, and does not cover the network.",
+          },
+        ],
       },
       {
         ref: "o2",

@@ -99,6 +99,54 @@ async function main() {
     check(lifecycle() === "ended" && ds.at(-1)?.kind === "closing" && ds.at(-1)?.state === "completed", "the closing line played to completion before the session closed");
     await page.waitForSelector("text=This interview has ended", { timeout: 10000 });
     check(true, "participant page shows the ended notice, not an invalid-link error");
+
+    // --- Exclusive microphone ownership on one device: a local interview test and private consultant voice.
+    const until = async (cond: () => boolean, ms: number, what: string) => {
+      const t0 = Date.now();
+      while (!cond()) {
+        if (Date.now() - t0 > ms) throw new Error(`Browser voice check failed: timed out waiting for ${what}`);
+        await sleep(200);
+      }
+    };
+    const tomId = (svc.db.prepare("SELECT id FROM experts WHERE project_id = ? AND name = 'Tom Becker'").get(id) as any).id;
+    const local = await post(`/api/projects/${id}/interviews`, { expertId: tomId, mode: "live_voice_mock_reasoning", localTest: true });
+    const started = await post(`/api/projects/${id}/interviews/${local.id}/start`);
+    const ivRow = () => svc.db.prepare("SELECT lifecycle, pause_reason FROM interviews WHERE id = ?").get(local.id) as any;
+    const expertTurnCount = () => (svc.db.prepare("SELECT COUNT(*) AS n FROM transcript_turns WHERE interview_id = ? AND speaker = 'expert'").get(local.id) as any).n;
+    const ctx2 = await browser.newContext();
+    await ctx2.grantPermissions(["microphone"], { origin: base });
+    const respondent = await ctx2.newPage();
+    const consultant = await ctx2.newPage();
+    for (const p of [respondent, consultant]) {
+      p.on("pageerror", (e) => errors.push(String(e)));
+      p.on("console", (m) => m.type() === "error" && !/status of 404/.test(m.text()) && errors.push(m.text()));
+    }
+    await respondent.goto(base + started.joinPath);
+    await respondent.getByRole("button", { name: "Join with microphone" }).click();
+    await respondent.getByRole("button", { name: "I agree to participate" }).click({ timeout: 15000 });
+    await until(() => ivRow().lifecycle === "active" && sim.stats.appends.interview > 0, 30000, "respondent audio reaching the interview session");
+    check(true, "local test: the respondent's microphone feeds the interview session");
+
+    await consultant.goto(`${base}/projects/${id}`);
+    await consultant.getByRole("button", { name: "Enable voice / Start briefing" }).click();
+    await respondent.waitForSelector("text=The microphone is in use by the consultant", { timeout: 15000 });
+    await until(() => ivRow().lifecycle === "paused" && ivRow().pause_reason === "consultant_private_voice", 10000, "interview paused for private voice");
+    check(true, "private voice claims the microphone: the respondent's capture stops and the interview pauses");
+    await sleep(500); // frames already in flight when ownership changed
+    const frozenAppends = sim.stats.appends.interview;
+    const frozenTurns = expertTurnCount();
+    const copilotBefore = sim.stats.appends.copilot;
+    const voiceMsgs = () => svc.db.prepare("SELECT role, tool_name AS tool FROM copilot_messages WHERE project_id = ? AND channel = 'voice'").all(id) as any[];
+    await until(() => voiceMsgs().some((m) => m.role === "consultant") && voiceMsgs().some((m) => m.tool === "get_handoff"), 30000, "a consultant voice turn and tool call");
+    check(sim.stats.appends.copilot > copilotBefore, "the consultant's microphone feeds only the private copilot session");
+    check(sim.stats.appends.interview === frozenAppends && expertTurnCount() === frozenTurns, "no consultant audio reached the interview session and no expert turn was created");
+
+    await consultant.getByRole("button", { name: "Stop voice" }).click();
+    await until(() => ivRow().lifecycle === "active", 10000, "interview resumed after private voice");
+    await respondent.getByRole("button", { name: "Reclaim microphone" }).click();
+    await until(() => sim.stats.appends.interview > frozenAppends, 30000, "respondent audio after reclaiming the microphone");
+    check(true, "stopping private voice resumes the interview; the respondent reclaims the microphone explicitly");
+    await post(`/api/projects/${id}/interviews/${local.id}/stop`, { reason: "test complete" });
     check(errors.length === 0, `no page errors${errors.length ? `: ${errors.join(" | ")}` : ""}`);
   } finally {
     await browser.close();

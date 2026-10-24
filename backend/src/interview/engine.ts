@@ -52,8 +52,11 @@ export class InterviewEngine {
     return this.providers.mock;
   }
 
-  attachTransport(interviewId: string, t: InterviewTransport) {
+  /** Attach the interview's live transport; returns the one it replaces, if any. */
+  attachTransport(interviewId: string, t: InterviewTransport): InterviewTransport | null {
+    const previous = this.transports.get(interviewId) ?? null;
     this.transports.set(interviewId, t);
+    return previous;
   }
   detachTransport(interviewId: string, t: InterviewTransport) {
     if (this.transports.get(interviewId) === t) this.transports.delete(interviewId);

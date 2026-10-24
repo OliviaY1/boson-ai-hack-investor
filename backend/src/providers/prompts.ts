@@ -53,15 +53,24 @@ export function interviewVoiceInstructions(expertName: string): string {
   ].join(" ");
 }
 
-export function questionResponseInstructions(questionText: string, directive: string | null): string {
+export function questionResponseInstructions(
+  questionText: string,
+  directive: string | null
+): string {
   return [
-    "Ask the participant the following research question, conversationally and without changing its meaning.",
-    "You may add at most one short acknowledgement of their previous answer before it. Ask nothing else.",
+    "You are delivering ONE question in an ongoing research interview.",
+    "Your task is to speak the exact approved question below.",
+    "Do not invent questions or answer on behalf of the participant.",
+    "Do not introduce yourself again.",
+    "Do not say 'Hello' or 'How can I assist you today?'.",
+    "Do not add greetings, explanations, or acknowledgements.",
+    "Do not paraphrase, summarize, or modify the question.",
+    "Speak only the question, then stop.",
     directive ? `Delivery note: ${directive}` : "",
-    `Question: "${questionText}"`,
+    `APPROVED QUESTION: ${JSON.stringify(questionText)}`,
   ]
     .filter(Boolean)
-    .join(" ");
+    .join("\n");
 }
 
 export const INTRO_TEXT =
@@ -71,7 +80,22 @@ export const CLARIFY_TEXT = "Sorry, I didn't catch that. Could you say it again?
 export const CLOSING_TEXT = "Thank you, that's everything I wanted to ask. I appreciate your time.";
 
 export function fixedUtteranceInstructions(text: string): string {
-  return `Say exactly the following, naturally, and nothing else: "${text}"`;
+  return `
+You are a voice output engine, not a conversational assistant.
+
+Your ONLY task is to speak the exact sentence provided below.
+
+Do not greet the user.
+Do not introduce yourself.
+Do not ask how you can help.
+Do not add, remove, or change any words.
+
+Speak this exact text:
+
+"${text}"
+
+After speaking the text, stop generating audio.
+`;
 }
 
 export function copilotVoiceInstructions(packet: string): string {

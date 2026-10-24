@@ -189,7 +189,16 @@ export class InterviewVoiceSession implements InterviewTransport {
       case "response.created": {
         const c = this.current;
         const rid = (e.response as any)?.id ?? null;
-        if (!c || c.responseId) return; // a response we did not request
+        if (!c || c.responseId || this.ended) {
+          console.warn(
+            "[Higgs] Unexpected response:",
+            rid
+          );
+
+          // Do not associate an unsolicited response
+          // with an authorized interview question.
+          return;
+        }
         c.responseId = rid;
         const p = iv();
         commit(this.ctx, p.project_id, "delivery.speaking", (cs) => {
@@ -227,11 +236,70 @@ export class InterviewVoiceSession implements InterviewTransport {
         return;
       }
       case "response.output_audio_transcript.done": {
-        const c = this.current;
-        if (c && (e as any).response_id === c.responseId) {
-          if (!c.interrupted) c.transcript = String((e as any).transcript ?? c.transcript);
-          this.participant.sendJson({ type: "assistant_text", deliveryId: c.deliveryId, text: c.transcript });
+        if (this.ended) {
+          console.warn(
+            "[Higgs] Ignoring transcript after voice session ended"
+          );
+          return;
         }
+
+        const c = this.current;
+
+        if (c && (e as any).response_id === c.responseId) {
+
+          if (!c.interrupted) {
+            c.transcript = String(
+              (e as any).transcript ?? c.transcript
+            );
+
+            // NEW: Log what Higgs was supposed to say vs. what it said
+            const delivery = this.ctx.db
+              .prepare(
+                "SELECT kind, authorized_text FROM delivery_attempts WHERE id = ?"
+              )
+              .get(c.deliveryId) as
+                | { kind: string; authorized_text: string }
+                | undefined;
+
+            console.log("[Higgs delivery]", {
+              kind: delivery?.kind,
+              expected: delivery?.authorized_text,
+              actual: c.transcript,
+            });
+          }
+
+          // EXISTING: Check whether Higgs changed the question
+          if (c.kind === "question" && !c.interrupted) {
+            const delivery = this.ctx.db
+              .prepare(
+                "SELECT authorized_text FROM delivery_attempts WHERE id = ?"
+              )
+              .get(c.deliveryId) as
+                | { authorized_text: string }
+                | undefined;
+
+            const normalize = (value: string) =>
+              value.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+
+            if (
+              delivery &&
+              normalize(c.transcript) !== normalize(delivery.authorized_text)
+            ) {
+              console.warn("[Higgs question mismatch]", {
+                deliveryId: c.deliveryId,
+                expected: delivery.authorized_text,
+                actual: c.transcript,
+              });
+            }
+          }
+
+          this.participant.sendJson({
+            type: "assistant_text",
+            deliveryId: c.deliveryId,
+            text: c.transcript,
+          });
+        }
+
         return;
       }
       case "response.done": {
@@ -265,6 +333,22 @@ export class InterviewVoiceSession implements InterviewTransport {
       case "conversation.item.input_audio_transcription.completed": {
         const itemId = String((e as any).item_id ?? "");
         const text = String((e as any).transcript ?? "").trim();
+
+        const matched = this.ctx.db.prepare(
+          `SELECT id
+          FROM transcript_turns
+          WHERE interview_id = ?
+            AND input_item_id = ?`
+        ).get(this.interviewId, itemId);
+
+        console.log("[Higgs transcription]", {
+          itemId,
+          matched: Boolean(matched),
+          hasText: text.length > 0,
+          textLength: text.length,
+          pendingCount: this.pending.length,
+        });
+
         this.onTranscription(itemId, text);
         return;
       }

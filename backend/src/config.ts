@@ -61,7 +61,7 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     allowLiveVoiceMockReasoning: env.ALLOW_LIVE_VOICE_MOCK_REASONING === "true",
     joinTokenTtlMinutes: Number(env.JOIN_TOKEN_TTL_MINUTES ?? 120),
     maxUploadBytes: Number(env.MAX_UPLOAD_BYTES ?? 5 * 1024 * 1024),
-    transcriptionTimeoutMs: Number(env.TRANSCRIPTION_TIMEOUT_MS ?? 12000),
+    transcriptionTimeoutMs: Number(env.TRANSCRIPTION_TIMEOUT_MS ?? 20000),
     providerTimeoutMs: Number(env.PROVIDER_TIMEOUT_MS ?? 45000),
     serveStatic: env.SERVE_STATIC !== "false",
     ...overrides,

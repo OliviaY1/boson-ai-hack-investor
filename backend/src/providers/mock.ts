@@ -522,14 +522,24 @@ function mockControl(env: ControllerEnvelope): ControllerProposal {
   }
   const relevant = new Set(ctx.relevantClaimIds);
   const candidates = ctx.questions
-    .filter((q) => {
-      const cov = answeredNow.get(q.id) ?? q.coverage;
-      if (cov !== "pending") return false;
-      if (q.completedDeliveries > 0 || q.askedSinceLastExpertTurn) return false;
-      if (q.origin === "planner" && relevant.size && !q.claimIds.some((c) => relevant.has(c))) return false;
-      return true;
+  .filter((q) => {
+    const cov = answeredNow.get(q.id) ?? q.coverage;
+
+    // Only select questions that have not been delivered.
+    if (q.completedDeliveries > 0) return false;
+
+    // Avoid selecting a question already being asked.
+    if (q.askedSinceLastExpertTurn) return false;
+
+    // Allow all questions from the research plan,
+    // regardless of their claim relevance to this expert.
+    return cov === "pending";
+  })
+  .sort((a, b) =>
+    a.code.localeCompare(b.code, undefined, {
+      numeric: true
     })
-    .sort((a, b) => originRank(a.origin) - originRank(b.origin) || a.priority - b.priority || a.code.localeCompare(b.code, undefined, { numeric: true }));
+  );
   if (candidates.length) {
     const q = candidates[0];
     out.next_action = { type: "ask", question_ref: q.id, question_revision: q.revision, delivery_directive: null };

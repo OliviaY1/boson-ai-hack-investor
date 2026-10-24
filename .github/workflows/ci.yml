@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Typecheck, tests, build, browser journey (no credentials)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:browser -- --shots artifacts/shots
+      - name: Browser audio path (fake microphone, simulated provider)
+        run: npm run test:browser-voice
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: browser-journey-screenshots
+          path: artifacts/shots/
+          if-no-files-found: ignore
+
+  live-boson:
+    name: Live Higgs checks (BOSON_API_KEY secret)
+    # Secrets are not available to pull requests from forks; run only where the secret can be used.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      BOSON_API_KEY: ${{ secrets.BOSON_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Run live probe
+        run: npm run probe:live -- --require-key --out artifacts/live-probe/live-probe.json
+      - name: Summarize
+        if: always()
+        run: |
+          node -e '
+            const fs = require("fs");
+            const f = "artifacts/live-probe/live-probe.json";
+            if (!fs.existsSync(f)) { console.log("No probe result was written."); process.exit(0); }
+            const r = JSON.parse(fs.readFileSync(f, "utf8"));
+            const icon = { pass: "✅", fail: "❌", skipped: "⏭️" };
+            const esc = (s) => String(s).replace(/\|/g, "\\|").replace(/\n/g, " ").slice(0, 400);
+            const lines = [`### Live Higgs probe: ${r.summary.pass} passed, ${r.summary.fail} failed, ${r.summary.skipped} skipped`, "", `Endpoint ${r.endpoint}, model ${r.model}, transcription ${r.transcriptionModel}`, "", "| Check | Result | ms | Detail |", "|---|---|---|---|"];
+            for (const c of r.checks) lines.push(`| ${c.name} | ${icon[c.status]} | ${c.ms ?? ""} | ${esc(c.detail)} |`);
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join("\n") + "\n");
+          '
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: live-probe
+          path: artifacts/live-probe/
+          if-no-files-found: ignore

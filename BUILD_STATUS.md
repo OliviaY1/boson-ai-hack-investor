@@ -26,7 +26,8 @@ Legend: **verified** (exercised by a passing check named here), **implemented** 
 | Higgs copilot session (server VAD, one briefing, deduped tool loop, barge-in, isolation from the interview) | verified against protocol fixtures | `voice.protocol.test.ts` |
 | Anthropic reasoning adapter (structured outputs, tool loop, fallbacks) | implemented | no `ANTHROPIC_API_KEY` available; the live probe checks one planner call when the key is set |
 | Workspace UI: overview, experts, plan, live research, findings, copilot, participant join page | verified | `npm run test:browser` (Chromium, 10 checks, no console errors) |
-| Browser audio: AudioWorklet capture, energy VAD, PCM playback, mic ownership | implemented | compiled and wired; not exercised with a real microphone (see below) |
+| Browser audio: AudioWorklet capture, energy VAD, PCM playback with drained reports, barge-in flush, closing line | verified with a fake microphone against a simulated provider | `npm run test:browser-voice` (Chromium fake capture device fed a synthetic voice-like WAV; `tests/e2e/simHiggs.ts`). Not a real microphone, speakers, echo, or the real provider |
+| Exclusive microphone ownership between participant test and consultant voice on one device | implemented | BroadcastChannel ownership in `frontend/src/audio/micOwnership.ts`; not exercised in a browser |
 | Northstar deterministic demo (fixtures, six experts, three recommendations, all 10 steps) | verified | `state.test.ts` adaptive demo; browser journey |
 | Live Higgs probe script | verified against a simulated endpoint | `npm run probe:live` dry run: 14 pass, 1 skipped (no Anthropic key) |
 | GitHub Actions: credential-free job + live job using the `BOSON_API_KEY` secret | implemented | `.github/workflows/ci.yml`; first run happens on the pull request |
@@ -36,7 +37,7 @@ Legend: **verified** (exercised by a passing check named here), **implemented** 
 
 | Check | Status |
 | --- | --- |
-| Higgs live: session ack, speech output, final transcription, controller after final transcript, barge-in, copilot VAD + tool loop | **pending**: `api.boson.ai` is blocked by this build environment's network policy (proxy 403), so the probe runs in the GitHub Actions "Live Higgs checks" job with the repository secret. Result recorded below once the job has run. |
+| Higgs live: session ack, speech output, final transcription, controller after final transcript, barge-in, copilot VAD + tool loop | **blocked**: `api.boson.ai` is unreachable from the build environment (proxy 403), so the probe runs in the GitHub Actions "Live Higgs checks" job. On CI runs 1 (two attempts) and 2 of PR #1 the job received an empty `BOSON_API_KEY`, so no live call was made. It needs an Actions *repository* secret named `BOSON_API_KEY` (or the job pointed at the environment that holds it). |
 | Live expert turn through real Anthropic reasoning | **blocked**: no `ANTHROPIC_API_KEY` provided. Set it as a repository secret and add it to the live job's `env`, or run `npm run probe:live` locally with both keys. |
 | Real microphone and speaker in a browser | **blocked**: needs a human-operated browser with a microphone. Steps: set both keys, `npm run dev`, start a *Live voice* interview, open the participant link in Chrome, accept the mic prompt, answer a question, talk over the next question (playback must stop at once), and open the copilot voice in the same browser to confirm the interview pauses and the mic switches owner. |
 

@@ -74,8 +74,14 @@ export class InterviewEngine {
     return next;
   }
 
-  whenIdle(interviewId: string): Promise<void> {
-    return this.queues.get(interviewId) ?? Promise.resolve();
+  /** Resolves once no controller work is queued, including recomputes chained by earlier runs. */
+  async whenIdle(interviewId: string): Promise<void> {
+    for (;;) {
+      const q = this.queues.get(interviewId);
+      if (!q) return;
+      await q;
+      if (this.queues.get(interviewId) === q) return;
+    }
   }
 
   private async runController(interviewId: string, trigger: string, mode: "interview" | "extract_only", onlyTurnIds?: string[]) {
@@ -95,17 +101,16 @@ export class InterviewEngine {
     }
     const providerMs = performance.now() - t0;
     const parsed = parseProposal(raw);
-    if (!parsed.ok) {
-      recordFailedDecision(this.ctx, envelope, provider.name, "rejected_invalid", parsed.reasons, providerMs, raw);
-      return;
-    }
-    const errors = validateProposal(parsed.proposal, vctx);
-    if (errors.length) {
+    const errors = parsed.ok ? validateProposal(parsed.proposal, vctx) : parsed.reasons;
+    if (!parsed.ok || errors.length) {
+      // Nothing from an invalid proposal is applied. One fresh attempt is allowed so a live interview
+      // does not stall on a single malformed model response.
       recordFailedDecision(this.ctx, envelope, provider.name, "rejected_invalid", errors, providerMs, raw);
+      if (mode === "interview" && !trigger.startsWith("retry_after_invalid")) void this.enqueue(interviewId, `retry_after_invalid(${trigger})`, mode, onlyTurnIds);
       return;
     }
     const tc = performance.now();
-    const outcome = applyProposal(this.ctx, envelope, parsed.proposal, provider.name, providerMs);
+    const outcome = applyProposal(this.ctx, envelope, parsed.proposal!, provider.name, providerMs);
     const commitMs = performance.now() - tc;
     commit(this.ctx, iv.project_id, "metrics.controller", (cs) => {
       const turnId = envelope.context.newTurns[envelope.context.newTurns.length - 1]?.id ?? null;
@@ -143,7 +148,8 @@ export class InterviewEngine {
       ).result;
       t.deliver(id);
     }
-    this.stop(interviewId, reason, false);
+    // Graceful end: the generation bump stops all question work, but the closing line may still play.
+    endInterview(this.ctx, interviewId, reason, undefined, true);
   }
 
   /** Stop: cancel pending speech and controller work (generation bump), release the guard. */

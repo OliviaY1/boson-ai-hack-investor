@@ -35,6 +35,7 @@ export interface VoiceSettings {
 
 interface Current {
   deliveryId: string;
+  kind: string;
   generation: number;
   responseId: string | null;
   itemId: string | null;
@@ -141,13 +142,16 @@ export class InterviewVoiceSession implements InterviewTransport {
       const d = this.ctx.db.prepare("SELECT * FROM delivery_attempts WHERE id = ?").get(id) as any;
       const iv = getInterview(this.ctx, this.interviewId);
       if (!d || d.state !== "queued") continue;
-      if (d.generation !== iv.generation || iv.lifecycle === "ended" || (d.kind === "question" && iv.lifecycle !== "active")) {
+      // The closing line is authorized at a graceful end, after the generation bump; nothing else plays then.
+      const closing = d.kind === "closing";
+      if (!closing && (d.generation !== iv.generation || iv.lifecycle === "ended" || (d.kind === "question" && iv.lifecycle !== "active"))) {
         commit(this.ctx, iv.project_id, "delivery.cancelled", (cs) => transitionDelivery(this.ctx, cs, id, "cancelled", { detail: `not current (${iv.lifecycle})` }));
         continue;
       }
       const instructions = d.kind === "question" ? questionResponseInstructions(d.authorized_text, null) : fixedUtteranceInstructions(d.authorized_text);
       this.current = {
         deliveryId: id,
+        kind: d.kind,
         generation: d.generation,
         responseId: null,
         itemId: null,
@@ -169,6 +173,7 @@ export class InterviewVoiceSession implements InterviewTransport {
     const c = this.current;
     if (!c || c.interrupted || this.ended) return false;
     if (!c.responseId || responseId !== c.responseId) return false;
+    if (c.kind === "closing") return true;
     const iv = getInterview(this.ctx, this.interviewId);
     return iv.generation === c.generation && iv.lifecycle !== "ended";
   }
@@ -351,6 +356,14 @@ export class InterviewVoiceSession implements InterviewTransport {
     if (this.current?.completionTimer) clearTimeout(this.current.completionTimer);
     this.current = null;
     this.pump();
+    if (!this.current && !this.ended) {
+      const iv = getInterview(this.ctx, this.interviewId);
+      if (iv.lifecycle === "ended") {
+        // Graceful end: the closing line has played (or could not); close the participant session.
+        this.participant.sendJson({ type: "ended", reason: iv.termination_reason });
+        this.teardown(null, false);
+      }
+    }
   }
 
   // -- participant input ------------------------------------------------------------------------
@@ -436,7 +449,8 @@ export class InterviewVoiceSession implements InterviewTransport {
     const c = this.current;
     if (!c) return;
     c.interrupted = true; // from here no further audio of this response is forwarded
-    if (!c.generationDone && c.responseId) this.higgs.send({ type: "response.cancel" });
+    // Cancel even if response.created has not arrived yet, so the provider never starts speaking it.
+    if (!c.generationDone) this.higgs.send({ type: "response.cancel" });
     let playedMs: number | null = typeof reportedPlayedMs === "number" ? reportedPlayedMs : null;
     if (playedMs === null) {
       this.participant.sendJson({ type: "flush", deliveryId: c.deliveryId });
@@ -490,7 +504,7 @@ export class InterviewVoiceSession implements InterviewTransport {
 
   /** Engine stop: cancel speech and pending work, then close both sides. */
   cancelAll(reason: string) {
-    if (this.current && !this.current.generationDone && this.current.responseId) this.higgs.send({ type: "response.cancel" });
+    if (this.current && !this.current.generationDone) this.higgs.send({ type: "response.cancel" });
     if (this.current) {
       this.current.interrupted = true;
       this.participant.sendJson({ type: "flush", deliveryId: this.current.deliveryId });

@@ -14,6 +14,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p frontend/tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:browser": "tsx tests/e2e/browser-journey.ts",
     "db:migrate": "tsx backend/scripts/migrate.ts",
     "demo:seed": "tsx backend/scripts/seed.ts",
     "demo:reset": "tsx backend/scripts/reset.ts",

@@ -1,24 +1,10 @@
 // Project state: one consistent snapshot plus committed server events applied in revision order.
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { Capabilities, CollectionName, Snapshot, StateEvent } from "../../../shared/contracts";
+import { applyEvent } from "../../../shared/applyEvent";
+import type { Capabilities, Snapshot, StateEvent } from "../../../shared/contracts";
 import { api } from "./api";
 
 export type LinkState = "connecting" | "live" | "reconnecting" | "offline";
-
-export function applyEvent(s: Snapshot, e: StateEvent): Snapshot {
-  const next: Snapshot = { ...s, project: e.project };
-  for (const [col, rows] of Object.entries(e.upserts) as [CollectionName, any[]][]) {
-    const copy = { ...(next[col] as Record<string, unknown>) };
-    for (const r of rows) copy[r.id] = r;
-    (next as any)[col] = copy;
-  }
-  for (const [col, ids] of Object.entries(e.removed) as [CollectionName, string[]][]) {
-    const copy = { ...(next[col] as Record<string, unknown>) };
-    for (const id of ids) delete copy[id];
-    (next as any)[col] = copy;
-  }
-  return next;
-}
 
 export function useProject(projectId: string) {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);

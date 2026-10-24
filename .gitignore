@@ -6,3 +6,7 @@ data/
 .DS_Store
 test-results/
 artifacts/tmp/
+
+# Local probe and browser journey output
+artifacts/live-probe/
+artifacts/shots/

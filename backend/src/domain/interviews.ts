@@ -152,7 +152,7 @@ export function resumeInterview(ctx: Ctx, interviewId: string) {
  * End the interview: release the guard, bump the generation (invalidating in-flight controller work and
  * provider responses), and cancel pending speech. Later transcripts are recorded but never restart it.
  */
-export function endInterview(ctx: Ctx, interviewId: string, reason: string, consent?: "declined" | "withdrawn") {
+export function endInterview(ctx: Ctx, interviewId: string, reason: string, consent?: "declined" | "withdrawn", graceful = false) {
   const iv = getInterview(ctx, interviewId);
   if (iv.lifecycle === "ended") return;
   commit(ctx, iv.project_id, "interview.ended", (cs) => {
@@ -161,13 +161,15 @@ export function endInterview(ctx: Ctx, interviewId: string, reason: string, cons
         "UPDATE interviews SET lifecycle = 'ended', termination_reason = ?, ended_at = ?, active_slot = NULL, generation = generation + 1, control_revision = control_revision + 1, consent = COALESCE(?, consent), join_token_expires_at = ? WHERE id = ?",
       )
       .run(reason, now(), consent ?? null, now(), interviewId);
-    cancelOpenDeliveries(ctx, cs, interviewId, `ended: ${reason}`);
+    // A graceful end (controller completed) keeps the authorized closing line; any other end cancels it.
+    cancelOpenDeliveries(ctx, cs, interviewId, `ended: ${reason}`, "interrupted", graceful ? ["closing"] : []);
     cs.touch("interviews", interviewId);
   });
 }
 
-function cancelOpenDeliveries(ctx: Ctx, cs: ChangeSet, interviewId: string, detail: string, speakingTo: DeliveryState = "interrupted") {
-  for (const d of ctx.db.prepare("SELECT id, state FROM delivery_attempts WHERE interview_id = ? AND state IN ('queued','speaking')").all(interviewId) as any[]) {
+function cancelOpenDeliveries(ctx: Ctx, cs: ChangeSet, interviewId: string, detail: string, speakingTo: DeliveryState = "interrupted", keepKinds: string[] = []) {
+  for (const d of ctx.db.prepare("SELECT id, state, kind FROM delivery_attempts WHERE interview_id = ? AND state IN ('queued','speaking')").all(interviewId) as any[]) {
+    if (keepKinds.includes(d.kind)) continue;
     transitionDelivery(ctx, cs, d.id, d.state === "queued" ? "cancelled" : speakingTo, { detail });
   }
 }
